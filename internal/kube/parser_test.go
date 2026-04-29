@@ -124,6 +124,58 @@ items:
 	}
 }
 
+// TestParseBytes_StatefulSet verifies StatefulSets land in the right slice
+// and their volumeClaimTemplates survive parsing intact — that's the
+// distinguishing feature of a StatefulSet vs a Deployment.
+func TestParseBytes_StatefulSet(t *testing.T) {
+	data := strings.TrimSpace(`
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: standard
+`)
+	m, err := ParseBytes([]byte(data))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	if len(m.StatefulSets) != 1 {
+		t.Fatalf("expected 1 StatefulSet, got %d", len(m.StatefulSets))
+	}
+	ss := m.StatefulSets[0]
+	if ss.Metadata.Name != "postgres" {
+		t.Errorf("name = %q, want postgres", ss.Metadata.Name)
+	}
+	if len(ss.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatalf("expected 1 VCT, got %d", len(ss.Spec.VolumeClaimTemplates))
+	}
+	if ss.Spec.VolumeClaimTemplates[0].Metadata.Name != "data" {
+		t.Errorf("VCT name = %q, want data", ss.Spec.VolumeClaimTemplates[0].Metadata.Name)
+	}
+}
+
 // TestParseBytes_UnknownKindIgnored verifies that resources we don't yet
 // support don't cause an error — they're simply skipped. Important for
 // kubectl input where the user's namespace may contain resources beyond what

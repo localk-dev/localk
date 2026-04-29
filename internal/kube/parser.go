@@ -118,6 +118,12 @@ func dispatchDoc(doc []byte, m *Manifests) error {
 			return fmt.Errorf("decoding Deployment: %w", err)
 		}
 		m.Deployments = append(m.Deployments, d)
+	case "StatefulSet":
+		var s StatefulSet
+		if err := yaml.Unmarshal(doc, &s); err != nil {
+			return fmt.Errorf("decoding StatefulSet: %w", err)
+		}
+		m.StatefulSets = append(m.StatefulSets, s)
 	case "Service":
 		var s Service
 		if err := yaml.Unmarshal(doc, &s); err != nil {

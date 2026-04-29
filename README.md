@@ -195,17 +195,20 @@ docker-compose constructs:
 
 | Kubernetes              | Docker Compose                            |
 |-------------------------|-------------------------------------------|
-| `Deployment`            | `service` (image, env, command, volumes)  |
-| `StatefulSet`           | `service` with named volume               |
-| `Service`               | service hostname + port mapping           |
-| `ConfigMap`             | `environment` entries / mounted files     |
-| `Secret`                | `.env` entries (with warning)             |
-| `PersistentVolumeClaim` | named `volume`                            |
-| `Ingress`               | (planned) Traefik container with routing  |
+| `Deployment`            | `service` (image, env, command, volumes)            |
+| `StatefulSet`           | `service` with named volume per `volumeClaimTemplate` |
+| `Service`               | service hostname + port mapping                     |
+| `ConfigMap`             | `environment` entries / mounted files               |
+| `Secret`                | `.env` entries (with warning)                       |
+| `PersistentVolumeClaim` | named `volume`                                      |
+| `Ingress`               | (planned) Traefik container with routing            |
 
 A `Deployment` named `api` and a `Service` named `api` are merged into one
 compose service called `api`. Other services in the stack can reach it at
-`http://api:<port>` — the same hostname they use in production.
+`http://api:<port>` — the same hostname they use in production. The same
+applies to `StatefulSet`s: each `volumeClaimTemplate` becomes a named
+compose volume prefixed with the workload name, so two stateful services
+that both call their data volume "data" don't collide.
 
 ## Configuration: `localk.yaml`
 
@@ -236,8 +239,8 @@ services:
 
 **How service names are matched.** The keys under `services:` match the
 final compose service name, which is the matched k8s `Service` name (or the
-`Deployment` name when no Service references the pod). This is the same
-hostname other services use to reach it in production.
+`Deployment` / `StatefulSet` name when no Service references the pod). This
+is the same hostname other services use to reach it in production.
 
 **Mismatches surface as warnings.** If your `localk.yaml` references a
 service name that doesn't show up in the input manifests (typo, renamed
@@ -271,8 +274,11 @@ localk generate ./k8s/ --config localk.staging.yaml
 
 ## Status
 
-Early. v0.1 supports `Deployment`, `Service`, `ConfigMap`, `Secret`, and
-`PersistentVolumeClaim`. Helm chart and Kustomize support is on the roadmap.
+Early. Currently supports `Deployment`, `StatefulSet`, `Service`,
+`ConfigMap`, `Secret`, and `PersistentVolumeClaim` — both from a directory
+of YAML files and from a live cluster via `localk generate -k`. Per-service
+overrides via `localk.yaml`. Ingress (Traefik), Helm template support, and
+Kustomize are on the roadmap.
 
 ## License
 

@@ -48,30 +48,24 @@ func Convert(m *kube.Manifests, cfg *config.Config) (*Result, error) {
 	// warn about typos / stale entries at the end.
 	overrideHits := map[string]bool{}
 
-	for _, dep := range m.Deployments {
-		name := serviceName(&dep, m)
-		override := cfg.ServiceOverrideFor(name)
-		if override.Skip || override.Image != "" || override.Build != nil {
-			overrideHits[name] = true
-		}
-		if override.Skip {
-			continue
-		}
-
-		svc, depWarnings, err := convertDeployment(&dep, m, declaredVolumes, res.Compose, &envFileLines, envFileSeen)
-		if err != nil {
+	for i := range m.Deployments {
+		w := workloadFromDeployment(&m.Deployments[i])
+		if err := convertWorkload(w, m, cfg, declaredVolumes, overrideHits, &envFileLines, envFileSeen, res); err != nil {
 			return nil, err
 		}
-		res.Warnings = append(res.Warnings, depWarnings...)
+	}
 
-		applyServiceOverride(&svc, override)
-		res.Compose.Services[name] = svc
+	for i := range m.StatefulSets {
+		w := workloadFromStatefulSet(&m.StatefulSets[i])
+		if err := convertWorkload(w, m, cfg, declaredVolumes, overrideHits, &envFileLines, envFileSeen, res); err != nil {
+			return nil, err
+		}
 	}
 
 	for name := range cfg.ServiceNames() {
 		if !overrideHits[name] {
 			res.Warnings = append(res.Warnings, fmt.Sprintf(
-				"localk.yaml: override for service %q did not match any Deployment in the input. Typo or stale entry?",
+				"localk.yaml: override for service %q did not match any Deployment or StatefulSet in the input. Typo or stale entry?",
 				name,
 			))
 		}
@@ -104,19 +98,107 @@ func applyServiceOverride(svc *compose.Service, ov config.ServiceOverride) {
 	}
 }
 
-// serviceName decides what to call a deployment in the compose file. We prefer
-// the matched Service's name (which is what other services use as a hostname
-// in production) over the Deployment's own name, so DNS continuity is
-// preserved locally.
-func serviceName(dep *kube.Deployment, m *kube.Manifests) string {
-	if svc := m.FindServiceForSelector(dep.Spec.Template.Metadata.Labels); svc != nil {
-		return svc.Metadata.Name
-	}
-	return dep.Metadata.Name
+// workload is the common shape we extract from both Deployments and
+// StatefulSets so the converter doesn't need to branch on the resource kind.
+// Replicas don't translate to compose, so we drop them entirely; what
+// matters is the pod template (containers, env, volumes) plus any
+// volumeClaimTemplates that need to materialize as named compose volumes.
+type workload struct {
+	kindLabel    string // "deployment" / "statefulset", used in warning messages
+	name         string // metadata.name from the workload
+	pod          kube.PodTemplate
+	volumeClaims []kube.PersistentVolumeClaimTemplate
 }
 
-func convertDeployment(
-	dep *kube.Deployment,
+func workloadFromDeployment(d *kube.Deployment) workload {
+	return workload{
+		kindLabel: "deployment",
+		name:      d.Metadata.Name,
+		pod:       d.Spec.Template,
+	}
+}
+
+func workloadFromStatefulSet(s *kube.StatefulSet) workload {
+	return workload{
+		kindLabel:    "statefulset",
+		name:         s.Metadata.Name,
+		pod:          s.Spec.Template,
+		volumeClaims: s.Spec.VolumeClaimTemplates,
+	}
+}
+
+// allVolumes returns the pod's declared volumes plus a synthetic kube.Volume
+// for each volumeClaimTemplate. The synthetic volume is shaped like a
+// regular PVC reference so the existing volume conversion path doesn't have
+// to know about VCTs at all — by the time it runs, every container
+// volumeMount has a matching entry here.
+//
+// We use the workload's own name as the claim-name prefix to ensure
+// uniqueness when multiple StatefulSets in the same input declare a VCT
+// with the same metadata.name (e.g. two different services both calling
+// their data volume "data").
+func (w workload) allVolumes() []kube.Volume {
+	if len(w.volumeClaims) == 0 {
+		return w.pod.Spec.Volumes
+	}
+	out := make([]kube.Volume, 0, len(w.pod.Spec.Volumes)+len(w.volumeClaims))
+	out = append(out, w.pod.Spec.Volumes...)
+	for _, vct := range w.volumeClaims {
+		claim := w.name + "-" + vct.Metadata.Name
+		out = append(out, kube.Volume{
+			Name: vct.Metadata.Name,
+			PVC:  &kube.PVCVolSource{ClaimName: claim},
+		})
+	}
+	return out
+}
+
+// convertWorkload runs one workload (Deployment or StatefulSet) through the
+// pipeline: resolve service name, apply localk.yaml override, convert pod
+// template, attach VCT-derived volumes, register the result.
+func convertWorkload(
+	w workload,
+	m *kube.Manifests,
+	cfg *config.Config,
+	declaredVolumes map[string]bool,
+	overrideHits map[string]bool,
+	envFileLines *[]string,
+	envFileSeen map[string]bool,
+	res *Result,
+) error {
+	name := serviceName(w, m)
+	override := cfg.ServiceOverrideFor(name)
+	if override.Skip || override.Image != "" || override.Build != nil {
+		overrideHits[name] = true
+	}
+	if override.Skip {
+		return nil
+	}
+
+	svc, warnings, err := convertPod(w, m, declaredVolumes, res.Compose, envFileLines, envFileSeen)
+	if err != nil {
+		return err
+	}
+	res.Warnings = append(res.Warnings, warnings...)
+
+	applyServiceOverride(&svc, override)
+	res.Compose.Services[name] = svc
+	return nil
+}
+
+// serviceName decides what to call a workload in the compose file. We prefer
+// the matched Service's name (which is what other services use as a hostname
+// in production) over the workload's own name, so DNS continuity is
+// preserved locally.
+func serviceName(w workload, m *kube.Manifests) string {
+	if svc := m.FindServiceForSelector(w.pod.Metadata.Labels); svc != nil {
+		return svc.Metadata.Name
+	}
+	return w.name
+}
+
+func convertPod(
+	w workload,
 	m *kube.Manifests,
 	declaredVolumes map[string]bool,
 	out *compose.File,
@@ -125,14 +207,14 @@ func convertDeployment(
 ) (compose.Service, []string, error) {
 	var warnings []string
 
-	containers := dep.Spec.Template.Spec.Containers
+	containers := w.pod.Spec.Containers
 	if len(containers) == 0 {
-		return compose.Service{}, nil, fmt.Errorf("deployment %s has no containers", dep.Metadata.Name)
+		return compose.Service{}, nil, fmt.Errorf("%s %s has no containers", w.kindLabel, w.name)
 	}
 	if len(containers) > 1 {
 		warnings = append(warnings, fmt.Sprintf(
-			"deployment %q has %d containers; only the first (%q) is converted. Sidecars are not yet supported.",
-			dep.Metadata.Name, len(containers), containers[0].Name,
+			"%s %q has %d containers; only the first (%q) is converted. Sidecars are not yet supported.",
+			w.kindLabel, w.name, len(containers), containers[0].Name,
 		))
 	}
 	c := containers[0]
@@ -159,8 +241,8 @@ func convertDeployment(
 			cm := m.FindConfigMap(ef.ConfigMapRef.Name)
 			if cm == nil {
 				warnings = append(warnings, fmt.Sprintf(
-					"deployment %q references ConfigMap %q via envFrom but it is not defined in the input",
-					dep.Metadata.Name, ef.ConfigMapRef.Name,
+					"%s %q references ConfigMap %q via envFrom but it is not defined in the input",
+					w.kindLabel, w.name, ef.ConfigMapRef.Name,
 				))
 				continue
 			}
@@ -171,8 +253,8 @@ func convertDeployment(
 			sec := m.FindSecret(ef.SecretRef.Name)
 			if sec == nil {
 				warnings = append(warnings, fmt.Sprintf(
-					"deployment %q references Secret %q via envFrom but it is not defined in the input",
-					dep.Metadata.Name, ef.SecretRef.Name,
+					"%s %q references Secret %q via envFrom but it is not defined in the input",
+					w.kindLabel, w.name, ef.SecretRef.Name,
 				))
 				continue
 			}
@@ -193,8 +275,8 @@ func convertDeployment(
 			cm := m.FindConfigMap(ref.Name)
 			if cm == nil {
 				warnings = append(warnings, fmt.Sprintf(
-					"env %q in deployment %q references ConfigMap %q which is not defined",
-					e.Name, dep.Metadata.Name, ref.Name,
+					"env %q in %s %q references ConfigMap %q which is not defined",
+					e.Name, w.kindLabel, w.name, ref.Name,
 				))
 				continue
 			}
@@ -204,8 +286,8 @@ func convertDeployment(
 			sec := m.FindSecret(ref.Name)
 			if sec == nil {
 				warnings = append(warnings, fmt.Sprintf(
-					"env %q in deployment %q references Secret %q which is not defined",
-					e.Name, dep.Metadata.Name, ref.Name,
+					"env %q in %s %q references Secret %q which is not defined",
+					e.Name, w.kindLabel, w.name, ref.Name,
 				))
 				continue
 			}
@@ -223,7 +305,7 @@ func convertDeployment(
 	// Map the matched Service's ports out to the host so the developer can
 	// reach them. Other services in the compose network reach this one by its
 	// hostname (the compose service name) on its container port.
-	if matched := m.FindServiceForSelector(dep.Spec.Template.Metadata.Labels); matched != nil {
+	if matched := m.FindServiceForSelector(w.pod.Metadata.Labels); matched != nil {
 		for _, p := range matched.Spec.Ports {
 			target := containerPortFromService(p, c)
 			svc.Ports = append(svc.Ports, fmt.Sprintf("%d:%d", p.Port, target))
@@ -232,11 +314,11 @@ func convertDeployment(
 
 	// --- Volumes ---
 	for _, vm := range c.VolumeMounts {
-		volSrc := findVolume(dep.Spec.Template.Spec.Volumes, vm.Name)
+		volSrc := findVolume(w.allVolumes(), vm.Name)
 		if volSrc == nil {
 			warnings = append(warnings, fmt.Sprintf(
-				"deployment %q has volumeMount %q with no matching volume in the pod spec",
-				dep.Metadata.Name, vm.Name,
+				"%s %q has volumeMount %q with no matching volume in the pod spec",
+				w.kindLabel, w.name, vm.Name,
 			))
 			continue
 		}

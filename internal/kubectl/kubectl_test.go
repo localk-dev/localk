@@ -69,7 +69,7 @@ func TestFetch_BuildsArgs(t *testing.T) {
 	if string(out) != "kind: List\nitems: []\n" {
 		t.Errorf("unexpected output: %q", out)
 	}
-	want := []string{"get", "deployment,service,configmap,secret,persistentvolumeclaim", "-n", "ns1", "-o", "yaml"}
+	want := []string{"get", "deployment,statefulset,service,configmap,secret,persistentvolumeclaim", "-n", "ns1", "-o", "yaml"}
 	if !reflect.DeepEqual(r.got[0], want) {
 		t.Errorf("args mismatch:\n got  %v\n want %v", r.got[0], want)
 	}
@@ -80,7 +80,7 @@ func TestFetch_WithContext(t *testing.T) {
 	if _, err := Fetch(r, context.Background(), FetchOptions{Namespace: "ns1", Context: "prod"}); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
-	want := []string{"get", "deployment,service,configmap,secret,persistentvolumeclaim", "-n", "ns1", "-o", "yaml", "--context", "prod"}
+	want := []string{"get", "deployment,statefulset,service,configmap,secret,persistentvolumeclaim", "-n", "ns1", "-o", "yaml", "--context", "prod"}
 	if !reflect.DeepEqual(r.got[0], want) {
 		t.Errorf("args mismatch:\n got  %v\n want %v", r.got[0], want)
 	}

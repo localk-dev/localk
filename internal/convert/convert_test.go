@@ -177,3 +177,91 @@ func TestConvert_OverrideUnknownServiceWarns(t *testing.T) {
 		t.Errorf("expected warning about unmatched override, got warnings: %v", result.Warnings)
 	}
 }
+
+// TestConvert_StatefulSet verifies a StatefulSet is converted like a
+// Deployment AND that its volumeClaimTemplates materialize as top-level
+// named compose volumes mounted into the service. This is the whole point
+// of supporting StatefulSets — their persistent storage shape is what
+// makes them different from Deployments.
+func TestConvert_StatefulSet(t *testing.T) {
+	manifests := &kube.Manifests{
+		StatefulSets: []kube.StatefulSet{{
+			Metadata: kube.ObjectMeta{Name: "postgres"},
+			Spec: kube.StatefulSetSpec{
+				ServiceName: "postgres",
+				Selector:    kube.LabelSelect{MatchLabels: map[string]string{"app": "postgres"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "postgres"}},
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{{
+							Name:  "postgres",
+							Image: "postgres:16",
+							Ports: []kube.ContainerPort{{ContainerPort: 5432}},
+							VolumeMounts: []kube.VolumeMount{{
+								Name:      "data",
+								MountPath: "/var/lib/postgresql/data",
+							}},
+						}},
+					},
+				},
+				VolumeClaimTemplates: []kube.PersistentVolumeClaimTemplate{{
+					Metadata: kube.ObjectMeta{Name: "data"},
+				}},
+			},
+		}},
+		Services: []kube.Service{{
+			Metadata: kube.ObjectMeta{Name: "postgres"},
+			Spec: kube.ServiceSpec{
+				Selector: map[string]string{"app": "postgres"},
+				Ports:    []kube.ServicePort{{Port: 5432}},
+			},
+		}},
+	}
+
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	pg, ok := result.Compose.Services["postgres"]
+	if !ok {
+		t.Fatal("expected postgres service in compose output")
+	}
+	if pg.Image != "postgres:16" {
+		t.Errorf("image = %q, want postgres:16", pg.Image)
+	}
+	wantMount := "postgres-data:/var/lib/postgresql/data"
+	if len(pg.Volumes) != 1 || pg.Volumes[0] != wantMount {
+		t.Errorf("volumes = %v, want [%s]", pg.Volumes, wantMount)
+	}
+	if _, ok := result.Compose.Volumes["postgres-data"]; !ok {
+		t.Errorf("expected top-level volume %q to be declared, got %v", "postgres-data", result.Compose.Volumes)
+	}
+}
+
+// TestConvert_StatefulSetSkipOverride verifies localk.yaml overrides apply
+// to StatefulSets the same way they do to Deployments.
+func TestConvert_StatefulSetSkipOverride(t *testing.T) {
+	manifests := &kube.Manifests{
+		StatefulSets: []kube.StatefulSet{{
+			Metadata: kube.ObjectMeta{Name: "redis"},
+			Spec: kube.StatefulSetSpec{
+				Template: kube.PodTemplate{
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{{Name: "redis", Image: "redis:7"}},
+					},
+				},
+			},
+		}},
+	}
+	cfg := &config.Config{Services: map[string]config.ServiceOverride{
+		"redis": {Skip: true},
+	}}
+	result, err := convert.Convert(manifests, cfg)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if _, present := result.Compose.Services["redis"]; present {
+		t.Error("expected redis (StatefulSet) to be skipped via localk.yaml")
+	}
+}

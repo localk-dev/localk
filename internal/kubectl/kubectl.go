@@ -121,16 +121,16 @@ func CurrentNamespace(r Runner) (string, error) {
 // namespace, returning the raw YAML bytes (a single `kind: List` document).
 //
 // The kinds requested mirror what internal/convert can translate today:
-// Deployment, Service, ConfigMap, Secret, PersistentVolumeClaim. Adding a
-// new kind here without converter support is harmless (it'll be ignored by
-// the parser) but pointless.
+// Deployment, StatefulSet, Service, ConfigMap, Secret,
+// PersistentVolumeClaim. Adding a new kind here without converter support
+// is harmless (it'll be ignored by the parser) but pointless.
 func Fetch(r Runner, ctx context.Context, opts FetchOptions) ([]byte, error) {
 	if opts.Namespace == "" {
 		return nil, fmt.Errorf("kubectl Fetch: namespace is required")
 	}
 	args := []string{
 		"get",
-		"deployment,service,configmap,secret,persistentvolumeclaim",
+		"deployment,statefulset,service,configmap,secret,persistentvolumeclaim",
 		"-n", opts.Namespace,
 		"-o", "yaml",
 	}

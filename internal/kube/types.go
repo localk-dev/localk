@@ -34,6 +34,35 @@ type DeploymentSpec struct {
 	Template PodTemplate `yaml:"template"`
 }
 
+// StatefulSet is a subset of appsv1.StatefulSet. The pod template is
+// identical to a Deployment's; the differentiator is volumeClaimTemplates,
+// which Kubernetes uses to provision a per-replica PVC. Locally we collapse
+// each template into a single named compose volume — replicas don't make
+// sense in compose anyway, so one stateful service gets one persistent
+// volume per template.
+type StatefulSet struct {
+	APIVersion string          `yaml:"apiVersion"`
+	Kind       string          `yaml:"kind"`
+	Metadata   ObjectMeta      `yaml:"metadata"`
+	Spec       StatefulSetSpec `yaml:"spec"`
+}
+
+type StatefulSetSpec struct {
+	Replicas             int32                           `yaml:"replicas,omitempty"`
+	Selector             LabelSelect                     `yaml:"selector"`
+	Template             PodTemplate                     `yaml:"template"`
+	ServiceName          string                          `yaml:"serviceName,omitempty"`
+	VolumeClaimTemplates []PersistentVolumeClaimTemplate `yaml:"volumeClaimTemplates,omitempty"`
+}
+
+// PersistentVolumeClaimTemplate is the inline-PVC shape that StatefulSets
+// use to provision per-replica storage. Only the fields we actually need
+// to map into compose volumes are modeled.
+type PersistentVolumeClaimTemplate struct {
+	Metadata ObjectMeta `yaml:"metadata"`
+	Spec     PVCSpec    `yaml:"spec,omitempty"`
+}
+
 type LabelSelect struct {
 	MatchLabels map[string]string `yaml:"matchLabels,omitempty"`
 }
@@ -194,9 +223,10 @@ type PVCSpec struct {
 
 // Manifests is the bundle of resources parsed out of an input directory.
 type Manifests struct {
-	Deployments []Deployment
-	Services    []Service
-	ConfigMaps  []ConfigMap
-	Secrets     []Secret
-	PVCs        []PersistentVolumeClaim
+	Deployments  []Deployment
+	StatefulSets []StatefulSet
+	Services     []Service
+	ConfigMaps   []ConfigMap
+	Secrets      []Secret
+	PVCs         []PersistentVolumeClaim
 }
