@@ -189,14 +189,17 @@ func convertWorkload(
 		return nil
 	}
 
-	svc, warnings, err := convertPod(w, m, declaredVolumes, res.Compose, envFileLines, envFileSeen)
+	main, sidecars, warnings, err := convertPod(w, name, m, declaredVolumes, res.Compose, envFileLines, envFileSeen)
 	if err != nil {
 		return err
 	}
 	res.Warnings = append(res.Warnings, warnings...)
 
-	applyServiceOverride(&svc, override)
-	res.Compose.Services[name] = svc
+	applyServiceOverride(&main, override)
+	res.Compose.Services[name] = main
+	for sidecarName, sidecar := range sidecars {
+		res.Compose.Services[sidecarName] = sidecar
+	}
 	return nil
 }
 
@@ -211,33 +214,86 @@ func serviceName(w workload, m *kube.Manifests) string {
 	return w.name
 }
 
+// convertPod walks every container in the pod and produces:
+//   - main: the compose service for containers[0], named after the workload
+//   - sidecars: a map of <main>-<container.Name> → compose.Service for any
+//     additional containers, sharing main's network namespace via
+//     network_mode: service:<main>. This mirrors the k8s pod model where
+//     all containers share an IP and reach each other on localhost.
 func convertPod(
+	w workload,
+	mainName string,
+	m *kube.Manifests,
+	declaredVolumes map[string]bool,
+	out *compose.File,
+	envFileLines *[]string,
+	envFileSeen map[string]bool,
+) (compose.Service, map[string]compose.Service, []string, error) {
+	var warnings []string
+
+	containers := w.pod.Spec.Containers
+	if len(containers) == 0 {
+		return compose.Service{}, nil, nil, fmt.Errorf("%s %s has no containers", w.kindLabel, w.name)
+	}
+
+	// Pre-pass: identify volumes mounted by 2+ containers. These become
+	// shared scratch space (typical pattern: main writes logs into an
+	// emptyDir, sidecar tails them). Without promotion to a named volume,
+	// each compose service gets its own anonymous mount and the sharing
+	// silently breaks.
+	shared := sharedVolumeNames(containers)
+
+	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, false, "")
+	warnings = append(warnings, mainWarnings...)
+
+	// Service-derived ports are published only by the main container's
+	// service. Sidecars share that network namespace.
+	if matched := m.FindServiceForSelector(w.pod.Metadata.Labels); matched != nil {
+		for _, p := range matched.Spec.Ports {
+			target := containerPortFromService(p, containers[0])
+			main.Ports = append(main.Ports, fmt.Sprintf("%d:%d", p.Port, target))
+		}
+	}
+
+	var sidecars map[string]compose.Service
+	if len(containers) > 1 {
+		sidecars = make(map[string]compose.Service, len(containers)-1)
+		networkMode := "service:" + mainName
+		for _, c := range containers[1:] {
+			sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, true, networkMode)
+			warnings = append(warnings, scWarnings...)
+			sidecars[mainName+"-"+c.Name] = sc
+		}
+	}
+
+	return main, sidecars, warnings, nil
+}
+
+// buildContainerService converts a single container into a compose.Service.
+// When isSidecar is true, the resulting service has NetworkMode set
+// (sharing the main's namespace) and no Ports — both are required for
+// network_mode: service:<name> to be valid in compose.
+func buildContainerService(
+	c kube.Container,
 	w workload,
 	m *kube.Manifests,
 	declaredVolumes map[string]bool,
 	out *compose.File,
 	envFileLines *[]string,
 	envFileSeen map[string]bool,
-) (compose.Service, []string, error) {
+	shared map[string]bool,
+	isSidecar bool,
+	networkMode string,
+) (compose.Service, []string) {
 	var warnings []string
-
-	containers := w.pod.Spec.Containers
-	if len(containers) == 0 {
-		return compose.Service{}, nil, fmt.Errorf("%s %s has no containers", w.kindLabel, w.name)
-	}
-	if len(containers) > 1 {
-		warnings = append(warnings, fmt.Sprintf(
-			"%s %q has %d containers; only the first (%q) is converted. Sidecars are not yet supported.",
-			w.kindLabel, w.name, len(containers), containers[0].Name,
-		))
-	}
-	c := containers[0]
 
 	svc := compose.Service{
 		Image:   c.Image,
 		Restart: "unless-stopped",
 	}
-
+	if isSidecar {
+		svc.NetworkMode = networkMode
+	}
 	if len(c.Command) > 0 {
 		svc.Entrypoint = c.Command
 	}
@@ -286,9 +342,6 @@ func convertPod(
 	for _, e := range c.Env {
 		switch {
 		case e.ValueFrom == nil:
-			// Literal value — substitute any $(VAR) refs against earlier
-			// env entries we've already resolved. Matches kubelet's
-			// expansion behavior.
 			env[e.Name] = expandRefs(e.Value, env)
 		case e.ValueFrom.FieldRef != nil:
 			v, ok := resolveFieldRef(e.ValueFrom.FieldRef.FieldPath, w)
@@ -326,20 +379,8 @@ func convertPod(
 			svc.EnvFile = appendUnique(svc.EnvFile, ".env")
 		}
 	}
-
 	if len(env) > 0 {
 		svc.Environment = env
-	}
-
-	// --- Ports ---
-	// Map the matched Service's ports out to the host so the developer can
-	// reach them. Other services in the compose network reach this one by its
-	// hostname (the compose service name) on its container port.
-	if matched := m.FindServiceForSelector(w.pod.Metadata.Labels); matched != nil {
-		for _, p := range matched.Spec.Ports {
-			target := containerPortFromService(p, c)
-			svc.Ports = append(svc.Ports, fmt.Sprintf("%d:%d", p.Port, target))
-		}
 	}
 
 	// --- Volumes ---
@@ -352,7 +393,7 @@ func convertPod(
 			))
 			continue
 		}
-		entry, declareName, declared := composeVolumeEntry(volSrc, vm)
+		entry, declareName, declared := volumeEntryFor(volSrc, vm, shared, w.name)
 		if entry != "" {
 			svc.Volumes = append(svc.Volumes, entry)
 		}
@@ -374,10 +415,31 @@ func convertPod(
 		}
 	}
 
-	// Sort env_file for deterministic output.
 	sort.Strings(svc.EnvFile)
+	return svc, warnings
+}
 
-	return svc, warnings, nil
+// sharedVolumeNames returns the set of pod volume names referenced by 2+
+// containers — the candidates for promoting an emptyDir to a named volume
+// so all containers see the same data.
+func sharedVolumeNames(containers []kube.Container) map[string]bool {
+	count := map[string]int{}
+	for _, c := range containers {
+		seen := map[string]bool{} // dedupe within a single container
+		for _, vm := range c.VolumeMounts {
+			if !seen[vm.Name] {
+				seen[vm.Name] = true
+				count[vm.Name]++
+			}
+		}
+	}
+	out := map[string]bool{}
+	for name, n := range count {
+		if n > 1 {
+			out[name] = true
+		}
+	}
+	return out
 }
 
 func findVolume(vols []kube.Volume, name string) *kube.Volume {
@@ -389,14 +451,25 @@ func findVolume(vols []kube.Volume, name string) *kube.Volume {
 	return nil
 }
 
-// composeVolumeEntry returns (mount string, declared volume name, was a top-level
+// volumeEntryFor returns (mount string, declared volume name, was a top-level
 // volume declared) for a given k8s volume reference.
-func composeVolumeEntry(v *kube.Volume, vm kube.VolumeMount) (string, string, bool) {
+//
+// shared lists volume names referenced by 2+ containers in the same pod.
+// When an emptyDir falls into that set we promote it to a named compose
+// volume (prefixed with the workload name to avoid collisions) so every
+// container sharing it sees the same data — without promotion, each
+// compose service would get its own anonymous tmpfs and the sharing
+// silently breaks.
+func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, shared map[string]bool, workloadName string) (string, string, bool) {
 	switch {
 	case v.PVC != nil:
 		// Named volume that needs a top-level declaration.
 		return fmt.Sprintf("%s:%s", v.PVC.ClaimName, vm.MountPath), v.PVC.ClaimName, true
 	case v.EmptyDir != nil:
+		if shared[v.Name] {
+			named := workloadName + "-" + v.Name
+			return fmt.Sprintf("%s:%s", named, vm.MountPath), named, true
+		}
 		// Anonymous tmpfs-style volume; compose handles this fine without declaration.
 		return vm.MountPath, "", false
 	case v.HostPath != nil:

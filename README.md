@@ -251,6 +251,50 @@ applies to `StatefulSet`s: each `volumeClaimTemplate` becomes a named
 compose volume prefixed with the workload name, so two stateful services
 that both call their data volume "data" don't collide.
 
+### Sidecar containers
+
+Real-world pods routinely have a main container plus one or more
+sidecars — log shippers, metrics exporters, service-mesh proxies.
+localk preserves the k8s pod model: each container becomes its own
+compose service, but sidecars share the main's network namespace via
+`network_mode: service:<main>`, so `localhost:<port>` between them
+keeps working.
+
+```text
+# Pod with main app + log-shipper + metrics-exporter:
+services:
+  app:
+    image: example/app:1.0
+    ports:
+    - 8080:8080
+    volumes:
+    - app-logs:/var/log/app
+  app-log-shipper:
+    image: example/fluent-bit:latest
+    volumes:
+    - app-logs:/logs
+    network_mode: service:app
+  app-metrics:
+    image: example/exporter:1.0
+    environment:
+      TARGET: http://localhost:8080/metrics  # localhost still works!
+    network_mode: service:app
+volumes:
+  app-logs: {}
+```
+
+Sidecars are named `<main>-<container-name>` so their identity is
+predictable. They get no `ports:` of their own — compose forbids
+publishing ports while sharing another service's namespace, and the
+main publishes them all anyway.
+
+`emptyDir` volumes referenced by 2+ containers (the typical "main
+writes logs, sidecar reads them" pattern) are promoted to top-level
+named volumes, so the sharing works in compose the way it did in k8s.
+
+`initContainers` are not yet handled — they need ordered start-up
+that compose models awkwardly. Tracking as a follow-up.
+
 ### Downward API
 
 k8s manifests routinely declare env vars from the downward API

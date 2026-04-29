@@ -24,6 +24,10 @@ type Service struct {
 	Restart     string            `yaml:"restart,omitempty"`
 	Deploy      *Deploy           `yaml:"deploy,omitempty"`
 	Networks    []string          `yaml:"networks,omitempty"`
+	// NetworkMode lets a sidecar service share another service's network
+	// namespace via "service:<name>", matching the k8s "all containers in
+	// a pod share an IP" model. Mutually exclusive with Ports.
+	NetworkMode string `yaml:"network_mode,omitempty"`
 }
 
 // Build configures local image build instead of pulling.

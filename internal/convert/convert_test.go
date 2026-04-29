@@ -9,6 +9,7 @@ import (
 
 	"github.com/goccy/go-yaml"
 
+	"github.com/localk-dev/localk/internal/compose"
 	"github.com/localk-dev/localk/internal/config"
 	"github.com/localk-dev/localk/internal/convert"
 	"github.com/localk-dev/localk/internal/kube"
@@ -524,6 +525,197 @@ func TestConvert_DownwardAPIUnknownPathWarns(t *testing.T) {
 	if !found {
 		t.Errorf("expected warning about unsupported fieldPath, got %v", result.Warnings)
 	}
+}
+
+// TestConvert_Sidecar_NetworkSharing covers the most common pattern:
+// a main app container plus a metrics-exporter sidecar that scrapes the
+// main on localhost. Asserts (a) both compose services exist with the
+// right names, (b) the sidecar uses network_mode: service:<main> so
+// localhost still works between them, (c) the sidecar has no Ports of
+// its own (compose forbids it when sharing another service's network),
+// (d) the main keeps its Service-derived ports.
+func TestConvert_Sidecar_NetworkSharing(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{
+							{
+								Name:  "app",
+								Image: "example/app:1.0",
+								Ports: []kube.ContainerPort{{ContainerPort: 8080}},
+							},
+							{
+								Name:  "metrics",
+								Image: "example/exporter:1.0",
+								Ports: []kube.ContainerPort{{ContainerPort: 9090}},
+							},
+						},
+					},
+				},
+			},
+		}},
+		Services: []kube.Service{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.ServiceSpec{
+				Selector: map[string]string{"app": "app"},
+				Ports:    []kube.ServicePort{{Port: 8080}},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	main, ok := result.Compose.Services["app"]
+	if !ok {
+		t.Fatal("expected main service 'app'")
+	}
+	if main.NetworkMode != "" {
+		t.Errorf("main.NetworkMode = %q, want empty", main.NetworkMode)
+	}
+	if len(main.Ports) != 1 || main.Ports[0] != "8080:8080" {
+		t.Errorf("main.Ports = %v, want [8080:8080]", main.Ports)
+	}
+
+	sidecar, ok := result.Compose.Services["app-metrics"]
+	if !ok {
+		t.Fatalf("expected sidecar 'app-metrics' in compose services, got %v", keys(result.Compose.Services))
+	}
+	if sidecar.NetworkMode != "service:app" {
+		t.Errorf("sidecar.NetworkMode = %q, want service:app", sidecar.NetworkMode)
+	}
+	if len(sidecar.Ports) != 0 {
+		t.Errorf("sidecar must not have Ports when sharing another service's network; got %v", sidecar.Ports)
+	}
+	if sidecar.Image != "example/exporter:1.0" {
+		t.Errorf("sidecar.Image = %q, want example/exporter:1.0", sidecar.Image)
+	}
+}
+
+// TestConvert_Sidecar_SharedEmptyDirPromoted exercises the classic
+// pattern: main writes logs into an emptyDir, sidecar tails them. The
+// emptyDir name is referenced by both containers' volumeMounts, so we
+// must promote it to a named compose volume — otherwise each compose
+// service gets its own anonymous mount and the sharing silently breaks.
+func TestConvert_Sidecar_SharedEmptyDirPromoted(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{
+							{Name: "logs", EmptyDir: &kube.EmptyDirVol{}},
+							{Name: "scratch", EmptyDir: &kube.EmptyDirVol{}}, // not shared
+						},
+						Containers: []kube.Container{
+							{
+								Name:  "app",
+								Image: "example/app:1.0",
+								VolumeMounts: []kube.VolumeMount{
+									{Name: "logs", MountPath: "/var/log/app"},
+									{Name: "scratch", MountPath: "/tmp"},
+								},
+							},
+							{
+								Name:  "logger",
+								Image: "example/log-shipper:1.0",
+								VolumeMounts: []kube.VolumeMount{
+									{Name: "logs", MountPath: "/logs"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	// (a) Shared emptyDir promoted to a named volume on both services.
+	wantNamed := "app-logs:" // name is <workload>-<volume.name>
+	mainVols := result.Compose.Services["app"].Volumes
+	sidecarVols := result.Compose.Services["app-logger"].Volumes
+	mainHasShared := false
+	for _, v := range mainVols {
+		if strings.HasPrefix(v, wantNamed) {
+			mainHasShared = true
+			break
+		}
+	}
+	sideHasShared := false
+	for _, v := range sidecarVols {
+		if strings.HasPrefix(v, wantNamed) {
+			sideHasShared = true
+			break
+		}
+	}
+	if !mainHasShared || !sideHasShared {
+		t.Errorf("shared emptyDir 'logs' should appear as named volume %q in both services\n  main: %v\n  sidecar: %v", wantNamed, mainVols, sidecarVols)
+	}
+
+	// (b) Top-level volume declaration exists.
+	if _, present := result.Compose.Volumes["app-logs"]; !present {
+		t.Errorf("expected top-level volume 'app-logs', got %v", result.Compose.Volumes)
+	}
+
+	// (c) Non-shared 'scratch' stays an anonymous mount on the main only.
+	hasAnonScratch := false
+	for _, v := range mainVols {
+		if v == "/tmp" {
+			hasAnonScratch = true
+			break
+		}
+	}
+	if !hasAnonScratch {
+		t.Errorf("non-shared emptyDir 'scratch' should remain an anonymous mount; main vols: %v", mainVols)
+	}
+	if _, present := result.Compose.Volumes["app-scratch"]; present {
+		t.Error("non-shared emptyDir should NOT be promoted to a named volume")
+	}
+}
+
+// TestConvert_NoSidecarsForSingleContainer is the regression guard:
+// pods with one container shouldn't gain any sidecar services or
+// network_mode tweaks.
+func TestConvert_NoSidecarsForSingleContainer(t *testing.T) {
+	manifests, err := kube.ParseDir("../../examples/simple/k8s")
+	if err != nil {
+		t.Fatalf("ParseDir: %v", err)
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	for name, s := range result.Compose.Services {
+		if s.NetworkMode != "" {
+			t.Errorf("service %q has NetworkMode = %q in single-container input; should be empty", name, s.NetworkMode)
+		}
+		if strings.Contains(name, "-") && (name != "postgres" && name != "api" && name != "worker") {
+			// Whitelist the example's actual service names — anything
+			// else with a hyphen would suggest an unwanted sidecar.
+			t.Errorf("unexpected service %q in single-container example output", name)
+		}
+	}
+}
+
+func keys(m map[string]compose.Service) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // Test helpers — kept here so they're easy to find next to the tests
