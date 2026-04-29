@@ -18,3 +18,9 @@ coverage.txt
 # Generated output during local testing
 docker-compose.generated.yml
 docker-compose.local.yml
+
+# Claude Code config — kept entirely local; never committed
+.claude/
+
+# Personal project memory for Claude Code
+CLAUDE.md
