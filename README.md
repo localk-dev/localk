@@ -2,12 +2,18 @@
 
 > Run your Kubernetes stack locally with one command.
 
-`localk` reads your existing Kubernetes manifests and generates a working
-`docker-compose.yml` so every developer gets a full local stack in seconds —
-no cluster, no `kubectl`, no YAML rewrites.
+`localk` reads your existing Kubernetes manifests — from a directory or
+straight from a live cluster via `kubectl` (read-only) — and generates a
+working `docker-compose.yml` so every developer gets a full local stack in
+seconds, with no cluster running on their laptop and no YAML rewrites.
 
 ```bash
+# From a directory of manifests
 localk generate ./k8s/ -o docker-compose.yml
+
+# Or pull straight from your live cluster (read-only)
+localk generate -k -n my-namespace -o docker-compose.yml
+
 docker compose up
 ```
 
@@ -42,12 +48,145 @@ go install github.com/localk-dev/localk/cmd/localk@latest
 # Generate docker-compose.yml from a directory of k8s manifests
 localk generate ./k8s/
 
-# Specify output path
+# Or pull manifests from the active kubectl context (read-only)
+localk generate -k
+
+# Preview without writing anything to disk
+localk generate ./k8s/ --dry-run
+localk generate -k --dry-run
+
+# Send both docker-compose.yml and .env to a specific folder
+localk generate ./k8s/ --out-dir ./build/local
+
+# Or override the compose filename only
 localk generate ./k8s/ -o compose.local.yml
 
 # Start the stack
 docker compose -f compose.local.yml up
 ```
+
+### Where files are written
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--out-dir <dir>` | `.` | Folder for both outputs. Created if missing. |
+| `-o <file>` | `docker-compose.yml` | Compose file. Joined with `--out-dir` if relative; absolute paths win. |
+| `-env-out <file>` | `.env` | Sidecar secrets file. Same precedence as `-o`. |
+
+So `--out-dir ./build` writes `./build/docker-compose.yml` + `./build/.env`,
+while `--out-dir ./build -o /tmp/foo.yml` puts the compose file at `/tmp/foo.yml`
+and the env file at `./build/.env`.
+
+## Previewing the output (`--dry-run`)
+
+Add `--dry-run` to any `generate` invocation to print exactly what would be
+written, without touching disk:
+
+```bash
+localk generate ./k8s/ --dry-run
+localk generate -k -n maalerportal --dry-run
+```
+
+The compose YAML is printed in full so you can verify shape, image tags,
+ports, and volumes. Secret values in the `.env` preview are replaced with
+`<redacted>` so production secrets never end up in your terminal scrollback.
+
+```text
+--- DRY RUN: would write /work/docker-compose.yml (3 services) ---
+services:
+  api:
+    image: ghcr.io/example/api:1.4.2
+    ...
+
+--- DRY RUN: would write /work/.env (values redacted) ---
+DB_PASSWORD=<redacted>
+JWT_SECRET=<redacted>
+
+Dry run only — no files written. Re-run without --dry-run to save.
+```
+
+In `-k` mode the cluster confirmation prompt still fires before the read,
+so dry-run is the safest way to test a new namespace or context end-to-end.
+
+## Pulling from a live cluster
+
+If you don't have your manifests checked into the repo (Helm-rendered,
+Terraform-managed, applied by hand), `localk generate -k` pulls them straight
+from your cluster via `kubectl`:
+
+```bash
+# Use the active kubeconfig context + namespace, with confirmation
+localk generate -k
+
+# Pin a specific namespace
+localk generate -k -n maalerportal
+
+# Pin both context and namespace, skip confirmation (CI / scripts)
+localk generate -k --context staging -n maalerportal -y
+```
+
+Before any cluster call, localk prints the resolved context and namespace
+and asks you to confirm:
+
+```
+Cluster context: maalerportal-prod
+Namespace:       maalerportal
+Pulling (read-only): Deployments, Services, ConfigMaps, Secrets, PVCs
+localk only invokes `kubectl get` and `kubectl config view`.
+It never modifies, creates, or deletes anything in the cluster.
+Continue? [y/N]
+```
+
+### Safety: read-only by design
+
+localk's kubectl integration is provably read-only. The only kubectl
+subcommands it ever invokes are:
+
+- `kubectl get <resources> -n <namespace>` — fetch manifests
+- `kubectl config current-context` — read the active context
+- `kubectl config view --minify` — read the active namespace
+
+Any other verb (`apply`, `delete`, `patch`, `edit`, `exec`, `create`,
+`replace`, `scale`, `rollout`, `port-forward`, ...) is rejected before any
+process is spawned. The allowlist lives in
+[`internal/kubectl/kubectl.go`](internal/kubectl/kubectl.go) and is enforced
+by unit tests — read it, audit it, regression-test it.
+
+> **Secrets warning.** Cluster Secrets are decoded and written to a sidecar
+> `.env` file next to your compose file. These are real production values.
+> Add `.env` to `.gitignore` and never commit it.
+
+### Extra safety: a read-only kubeconfig context
+
+If you want defense-in-depth (or your own paranoia satisfied), point localk
+at a kubeconfig context tied to a read-only ServiceAccount:
+
+```yaml
+# read-only-sa.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: localk-readonly
+  namespace: maalerportal
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: localk-readonly-view
+  namespace: maalerportal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+- kind: ServiceAccount
+  name: localk-readonly
+  namespace: maalerportal
+```
+
+Apply that, then build a kubeconfig context from the ServiceAccount's token
+and pass `--context` to localk. Even if localk tried to do something
+destructive, the cluster would refuse it.
 
 ## How it works
 
@@ -68,18 +207,48 @@ A `Deployment` named `api` and a `Service` named `api` are merged into one
 compose service called `api`. Other services in the stack can reach it at
 `http://api:<port>` — the same hostname they use in production.
 
-## Configuration
+## Configuration: `localk.yaml`
 
-Optional `localk.yaml` in your repo root lets you override per-service behavior:
+Drop a `localk.yaml` in your repo root to tweak how the local stack is
+generated. The file is optional — without it, localk emits a faithful
+translation of your k8s manifests. With it, you can:
 
 ```yaml
 services:
   api:
-    build: ./services/api      # build from local Dockerfile instead of pulling
+    # Build from a local Dockerfile instead of pulling the prod image.
+    # Shorthand:
+    build: ./services/api
+    # Or explicit form when you need a non-default Dockerfile:
+    # build:
+    #   context: ./services/api
+    #   dockerfile: Dockerfile.dev
+
   worker:
-    skip: true                 # do not include this service locally
+    # Don't run this service locally — the developer runs it natively
+    # or doesn't need it at all.
+    skip: true
+
   postgres:
-    image: postgres:15-alpine  # override the image used in prod
+    # Use an upstream image locally instead of the custom prod build.
+    image: postgres:15-alpine
+```
+
+**How service names are matched.** The keys under `services:` match the
+final compose service name, which is the matched k8s `Service` name (or the
+`Deployment` name when no Service references the pod). This is the same
+hostname other services use to reach it in production.
+
+**Mismatches surface as warnings.** If your `localk.yaml` references a
+service name that doesn't show up in the input manifests (typo, renamed
+service, stale entry), localk prints a warning so the file doesn't silently
+rot.
+
+**Custom config path.** Pass `--config <path>` to use a different file —
+useful for per-environment configs:
+
+```bash
+localk generate ./k8s/ --config localk.staging.yaml
 ```
 
 ## What localk does NOT do
