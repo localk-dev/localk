@@ -35,73 +35,125 @@ func ParseDir(root string) (*Manifests, error) {
 	return m, nil
 }
 
+// ParseBytes parses a YAML byte stream — possibly multi-document, possibly
+// wrapped in a `kind: List` envelope as produced by `kubectl get -o yaml`
+// over multiple resource kinds — and returns a Manifests bundle.
+//
+// Used by the kubectl ingestion path, where we feed the raw output of
+// `kubectl get` straight into the converter without writing intermediate
+// files.
+func ParseBytes(data []byte) (*Manifests, error) {
+	m := &Manifests{}
+	if err := parseBytesInto(data, m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // parseFile parses a single YAML file (which may contain multiple documents
 // separated by `---`) and appends recognized resources to m.
-//
-// Implementation note: we split the file on document separators ourselves so
-// that each document's bytes can be decoded twice — once into a generic
-// envelope to learn the Kind, then once more into the specific typed resource.
-// This is simpler than navigating the goccy AST.
 func parseFile(path string, m *Manifests) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", path, err)
 	}
+	if err := parseBytesInto(data, m); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
 
+// parseBytesInto is the shared core: split into documents, dispatch each one
+// into m. Handles both individual resources and `kind: List` wrappers.
+func parseBytesInto(data []byte, m *Manifests) error {
 	docs, err := splitDocuments(data)
 	if err != nil {
-		return fmt.Errorf("splitting %s into documents: %w", path, err)
+		return fmt.Errorf("splitting documents: %w", err)
 	}
 
 	for _, doc := range docs {
 		if len(bytes.TrimSpace(doc)) == 0 {
 			continue
 		}
-
-		var envelope Resource
-		if err := yaml.Unmarshal(doc, &envelope); err != nil {
-			return fmt.Errorf("decoding envelope in %s: %w", path, err)
-		}
-		if envelope.Kind == "" {
-			continue
-		}
-
-		switch envelope.Kind {
-		case "Deployment":
-			var d Deployment
-			if err := yaml.Unmarshal(doc, &d); err != nil {
-				return fmt.Errorf("decoding Deployment in %s: %w", path, err)
-			}
-			m.Deployments = append(m.Deployments, d)
-		case "Service":
-			var s Service
-			if err := yaml.Unmarshal(doc, &s); err != nil {
-				return fmt.Errorf("decoding Service in %s: %w", path, err)
-			}
-			m.Services = append(m.Services, s)
-		case "ConfigMap":
-			var c ConfigMap
-			if err := yaml.Unmarshal(doc, &c); err != nil {
-				return fmt.Errorf("decoding ConfigMap in %s: %w", path, err)
-			}
-			m.ConfigMaps = append(m.ConfigMaps, c)
-		case "Secret":
-			var s Secret
-			if err := yaml.Unmarshal(doc, &s); err != nil {
-				return fmt.Errorf("decoding Secret in %s: %w", path, err)
-			}
-			m.Secrets = append(m.Secrets, s)
-		case "PersistentVolumeClaim":
-			var p PersistentVolumeClaim
-			if err := yaml.Unmarshal(doc, &p); err != nil {
-				return fmt.Errorf("decoding PVC in %s: %w", path, err)
-			}
-			m.PVCs = append(m.PVCs, p)
-		default:
-			// Silently ignore unsupported kinds for now.
+		if err := dispatchDoc(doc, m); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// dispatchDoc decodes a single YAML document. If it's a `kind: List` wrapper
+// (kubectl's default output for `get` over multiple kinds), it unwraps the
+// items and recurses. Otherwise it routes to the appropriate Manifests slice.
+func dispatchDoc(doc []byte, m *Manifests) error {
+	var envelope Resource
+	if err := yaml.Unmarshal(doc, &envelope); err != nil {
+		return fmt.Errorf("decoding envelope: %w", err)
+	}
+	if envelope.Kind == "" {
+		return nil
+	}
+
+	if envelope.Kind == "List" {
+		var list listDoc
+		if err := yaml.Unmarshal(doc, &list); err != nil {
+			return fmt.Errorf("decoding List: %w", err)
+		}
+		for _, item := range list.Items {
+			itemBytes, err := yaml.Marshal(item)
+			if err != nil {
+				return fmt.Errorf("re-marshaling List item: %w", err)
+			}
+			if err := dispatchDoc(itemBytes, m); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	switch envelope.Kind {
+	case "Deployment":
+		var d Deployment
+		if err := yaml.Unmarshal(doc, &d); err != nil {
+			return fmt.Errorf("decoding Deployment: %w", err)
+		}
+		m.Deployments = append(m.Deployments, d)
+	case "Service":
+		var s Service
+		if err := yaml.Unmarshal(doc, &s); err != nil {
+			return fmt.Errorf("decoding Service: %w", err)
+		}
+		m.Services = append(m.Services, s)
+	case "ConfigMap":
+		var c ConfigMap
+		if err := yaml.Unmarshal(doc, &c); err != nil {
+			return fmt.Errorf("decoding ConfigMap: %w", err)
+		}
+		m.ConfigMaps = append(m.ConfigMaps, c)
+	case "Secret":
+		var s Secret
+		if err := yaml.Unmarshal(doc, &s); err != nil {
+			return fmt.Errorf("decoding Secret: %w", err)
+		}
+		m.Secrets = append(m.Secrets, s)
+	case "PersistentVolumeClaim":
+		var p PersistentVolumeClaim
+		if err := yaml.Unmarshal(doc, &p); err != nil {
+			return fmt.Errorf("decoding PVC: %w", err)
+		}
+		m.PVCs = append(m.PVCs, p)
+	default:
+		// Silently ignore unsupported kinds for now.
+	}
+	return nil
+}
+
+// listDoc mirrors the shape of `kubectl get ... -o yaml` when multiple kinds
+// are requested. Each item is a free-form map that we re-marshal and feed
+// back through dispatchDoc.
+type listDoc struct {
+	Kind  string                   `yaml:"kind"`
+	Items []map[string]interface{} `yaml:"items"`
 }
 
 // splitDocuments splits a YAML byte stream on document separators ("---" on

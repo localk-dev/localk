@@ -102,12 +102,12 @@ type VolumeMount struct {
 }
 
 type Volume struct {
-	Name      string         `yaml:"name"`
-	ConfigMap *ConfigMapVol  `yaml:"configMap,omitempty"`
-	Secret    *SecretVol     `yaml:"secret,omitempty"`
-	PVC       *PVCVolSource  `yaml:"persistentVolumeClaim,omitempty"`
-	EmptyDir  *EmptyDirVol   `yaml:"emptyDir,omitempty"`
-	HostPath  *HostPathVol   `yaml:"hostPath,omitempty"`
+	Name      string        `yaml:"name"`
+	ConfigMap *ConfigMapVol `yaml:"configMap,omitempty"`
+	Secret    *SecretVol    `yaml:"secret,omitempty"`
+	PVC       *PVCVolSource `yaml:"persistentVolumeClaim,omitempty"`
+	EmptyDir  *EmptyDirVol  `yaml:"emptyDir,omitempty"`
+	HostPath  *HostPathVol  `yaml:"hostPath,omitempty"`
 }
 
 type ConfigMapVol struct {
@@ -181,10 +181,10 @@ type Secret struct {
 
 // PersistentVolumeClaim is a subset of corev1.PersistentVolumeClaim.
 type PersistentVolumeClaim struct {
-	APIVersion string        `yaml:"apiVersion"`
-	Kind       string        `yaml:"kind"`
-	Metadata   ObjectMeta    `yaml:"metadata"`
-	Spec       PVCSpec       `yaml:"spec"`
+	APIVersion string     `yaml:"apiVersion"`
+	Kind       string     `yaml:"kind"`
+	Metadata   ObjectMeta `yaml:"metadata"`
+	Spec       PVCSpec    `yaml:"spec"`
 }
 
 type PVCSpec struct {
