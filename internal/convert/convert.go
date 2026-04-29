@@ -189,7 +189,7 @@ func convertWorkload(
 		return nil
 	}
 
-	main, sidecars, warnings, err := convertPod(w, name, m, declaredVolumes, res.Compose, envFileLines, envFileSeen)
+	main, extras, warnings, err := convertPod(w, name, m, declaredVolumes, res.Compose, envFileLines, envFileSeen)
 	if err != nil {
 		return err
 	}
@@ -197,8 +197,8 @@ func convertWorkload(
 
 	applyServiceOverride(&main, override)
 	res.Compose.Services[name] = main
-	for sidecarName, sidecar := range sidecars {
-		res.Compose.Services[sidecarName] = sidecar
+	for extraName, extra := range extras {
+		res.Compose.Services[extraName] = extra
 	}
 	return nil
 }
@@ -236,43 +236,73 @@ func convertPod(
 		return compose.Service{}, nil, nil, fmt.Errorf("%s %s has no containers", w.kindLabel, w.name)
 	}
 
-	// Pre-pass: identify volumes mounted by 2+ containers. These become
-	// shared scratch space (typical pattern: main writes logs into an
-	// emptyDir, sidecar tails them). Without promotion to a named volume,
-	// each compose service gets its own anonymous mount and the sharing
+	// Pre-pass: identify volumes mounted by 2+ containers (main, sidecars,
+	// or initContainers). These become shared scratch space — typical
+	// patterns are "main writes logs, sidecar tails them" and "init
+	// writes config, main reads it." Without promotion to a named volume,
+	// each compose service gets its own anonymous mount and sharing
 	// silently breaks.
-	shared := sharedVolumeNames(containers)
+	allContainers := append([]kube.Container{}, w.pod.Spec.InitContainers...)
+	allContainers = append(allContainers, containers...)
+	shared := sharedVolumeNames(allContainers)
 
-	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, false, "")
+	extras := map[string]compose.Service{}
+
+	// --- Init containers (run in declaration order, must complete before
+	// main starts). Each init becomes a one-shot compose service with
+	// restart: "no", and they form a depends_on chain so docker compose
+	// runs them sequentially. The main service then depends_on the last
+	// init with condition: service_completed_successfully.
+	var initNames []string
+	for i, c := range w.pod.Spec.InitContainers {
+		s, w2 := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared)
+		warnings = append(warnings, w2...)
+		s.Restart = "no"
+		name := mainName + "-" + c.Name
+		if i > 0 {
+			s.DependsOn = map[string]compose.DependsOnSpec{
+				initNames[i-1]: {Condition: "service_completed_successfully"},
+			}
+		}
+		extras[name] = s
+		initNames = append(initNames, name)
+	}
+
+	// --- Main container.
+	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, shared)
 	warnings = append(warnings, mainWarnings...)
 
-	// Service-derived ports are published only by the main container's
-	// service. Sidecars share that network namespace.
+	// Service-derived ports are published only by the main's service.
+	// Sidecars share that namespace, so a single host:port mapping covers
+	// the whole pod.
 	if matched := m.FindServiceForSelector(w.pod.Metadata.Labels); matched != nil {
 		for _, p := range matched.Spec.Ports {
 			target := containerPortFromService(p, containers[0])
 			main.Ports = append(main.Ports, fmt.Sprintf("%d:%d", p.Port, target))
 		}
 	}
-
-	var sidecars map[string]compose.Service
-	if len(containers) > 1 {
-		sidecars = make(map[string]compose.Service, len(containers)-1)
-		networkMode := "service:" + mainName
-		for _, c := range containers[1:] {
-			sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, true, networkMode)
-			warnings = append(warnings, scWarnings...)
-			sidecars[mainName+"-"+c.Name] = sc
+	if len(initNames) > 0 {
+		main.DependsOn = map[string]compose.DependsOnSpec{
+			initNames[len(initNames)-1]: {Condition: "service_completed_successfully"},
 		}
 	}
 
-	return main, sidecars, warnings, nil
+	// --- Sidecars (run alongside main, sharing its network namespace).
+	for _, c := range containers[1:] {
+		sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared)
+		warnings = append(warnings, scWarnings...)
+		sc.NetworkMode = "service:" + mainName
+		extras[mainName+"-"+c.Name] = sc
+	}
+
+	return main, extras, warnings, nil
 }
 
-// buildContainerService converts a single container into a compose.Service.
-// When isSidecar is true, the resulting service has NetworkMode set
-// (sharing the main's namespace) and no Ports — both are required for
-// network_mode: service:<name> to be valid in compose.
+// buildContainerService converts one k8s container into a generic compose
+// Service — env, env_file, volumes, resource limits — with no role-specific
+// tweaks. The caller decides what to do with the result based on whether
+// the container is the main, a sidecar (set NetworkMode, drop Ports), or an
+// init container (Restart="no", wire depends_on).
 func buildContainerService(
 	c kube.Container,
 	w workload,
@@ -282,17 +312,12 @@ func buildContainerService(
 	envFileLines *[]string,
 	envFileSeen map[string]bool,
 	shared map[string]bool,
-	isSidecar bool,
-	networkMode string,
 ) (compose.Service, []string) {
 	var warnings []string
 
 	svc := compose.Service{
 		Image:   c.Image,
 		Restart: "unless-stopped",
-	}
-	if isSidecar {
-		svc.NetworkMode = networkMode
 	}
 	if len(c.Command) > 0 {
 		svc.Entrypoint = c.Command

@@ -292,8 +292,49 @@ main publishes them all anyway.
 writes logs, sidecar reads them" pattern) are promoted to top-level
 named volumes, so the sharing works in compose the way it did in k8s.
 
-`initContainers` are not yet handled — they need ordered start-up
-that compose models awkwardly. Tracking as a follow-up.
+### initContainers
+
+`initContainers` run before the main starts and must each complete
+successfully before the next one fires. localk preserves that
+sequence by emitting one compose service per init container with
+`restart: "no"` (one-shot) and chaining them through `depends_on`
+with `condition: service_completed_successfully`. The main service
+then depends on the last init in the chain. Shared volumes (e.g.
+init writes config files into an `emptyDir` for main to read) get
+the same named-volume promotion as sidecars.
+
+```yaml
+# A pod with three init containers + main + sidecar boils down to:
+services:
+  app-wait-db:
+    image: busybox
+    restart: "no"
+  app-migrate:
+    image: example/migrate
+    depends_on:
+      app-wait-db:
+        condition: service_completed_successfully
+    restart: "no"
+  app-config-gen:
+    image: example/config-gen
+    volumes:
+    - app-config:/out
+    depends_on:
+      app-migrate:
+        condition: service_completed_successfully
+    restart: "no"
+  app:                              # main — runs after every init succeeds
+    image: example/app
+    ports: ["8080:8080"]
+    volumes:
+    - app-config:/etc/app
+    depends_on:
+      app-config-gen:
+        condition: service_completed_successfully
+  app-log-shipper:                  # sidecar — shares app's network
+    image: fluent-bit
+    network_mode: service:app
+```
 
 ### Downward API
 

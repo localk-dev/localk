@@ -686,6 +686,180 @@ func TestConvert_Sidecar_SharedEmptyDirPromoted(t *testing.T) {
 	}
 }
 
+// TestConvert_InitContainer_SingleChain covers the simplest init pattern:
+// one init container runs migrations, then the main app starts. Asserts
+// (a) init becomes its own compose service with restart: "no", (b) main
+// has depends_on the init with service_completed_successfully, (c) init
+// has no depends_on of its own (it runs first).
+func TestConvert_InitContainer_SingleChain(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						InitContainers: []kube.Container{{
+							Name:    "migrate",
+							Image:   "example/migrate:1.0",
+							Command: []string{"/bin/migrate", "--up"},
+						}},
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "example/app:1.0",
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	init, ok := result.Compose.Services["app-migrate"]
+	if !ok {
+		t.Fatalf("expected init service 'app-migrate', got %v", keys(result.Compose.Services))
+	}
+	if init.Restart != "no" {
+		t.Errorf("init.Restart = %q, want \"no\"", init.Restart)
+	}
+	if init.DependsOn != nil {
+		t.Errorf("first init shouldn't have depends_on, got %v", init.DependsOn)
+	}
+
+	main := result.Compose.Services["app"]
+	dep, ok := main.DependsOn["app-migrate"]
+	if !ok {
+		t.Fatalf("main.DependsOn should reference app-migrate, got %v", main.DependsOn)
+	}
+	if dep.Condition != "service_completed_successfully" {
+		t.Errorf("main.DependsOn[app-migrate].Condition = %q, want service_completed_successfully", dep.Condition)
+	}
+}
+
+// TestConvert_InitContainer_OrderedChain covers multiple init containers:
+// they must run in declaration order, so each (after the first) has a
+// depends_on the previous, and main depends on the LAST init.
+func TestConvert_InitContainer_OrderedChain(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						InitContainers: []kube.Container{
+							{Name: "wait-db", Image: "busybox:latest"},
+							{Name: "migrate", Image: "example/migrate:1.0"},
+							{Name: "seed", Image: "example/seed:1.0"},
+						},
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "example/app:1.0",
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	// First init has no depends_on.
+	if got := result.Compose.Services["app-wait-db"].DependsOn; got != nil {
+		t.Errorf("app-wait-db.DependsOn = %v, want nil", got)
+	}
+	// Middle init depends on first.
+	migrate := result.Compose.Services["app-migrate"]
+	if dep, ok := migrate.DependsOn["app-wait-db"]; !ok || dep.Condition != "service_completed_successfully" {
+		t.Errorf("app-migrate should depend on app-wait-db with service_completed_successfully; got %v", migrate.DependsOn)
+	}
+	// Last init depends on middle.
+	seed := result.Compose.Services["app-seed"]
+	if dep, ok := seed.DependsOn["app-migrate"]; !ok || dep.Condition != "service_completed_successfully" {
+		t.Errorf("app-seed should depend on app-migrate with service_completed_successfully; got %v", seed.DependsOn)
+	}
+	// Main depends on the LAST init only — not on every init.
+	main := result.Compose.Services["app"]
+	if len(main.DependsOn) != 1 {
+		t.Errorf("main should depend on exactly one service (the last init); got %v", main.DependsOn)
+	}
+	if dep, ok := main.DependsOn["app-seed"]; !ok || dep.Condition != "service_completed_successfully" {
+		t.Errorf("main.DependsOn[app-seed] = %+v, want completed-successfully", dep)
+	}
+}
+
+// TestConvert_InitContainer_SharedVolume verifies the typical pattern
+// where init writes config files into an emptyDir that the main reads.
+// The shared emptyDir must be promoted to a named volume so init's
+// writes survive into the main service's mount.
+func TestConvert_InitContainer_SharedVolume(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{
+							{Name: "config", EmptyDir: &kube.EmptyDirVol{}},
+						},
+						InitContainers: []kube.Container{{
+							Name:  "config-gen",
+							Image: "example/config-gen:1.0",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "config", MountPath: "/out"},
+							},
+						}},
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "example/app:1.0",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "config", MountPath: "/etc/app"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if _, ok := result.Compose.Volumes["app-config"]; !ok {
+		t.Errorf("expected promoted named volume 'app-config' (init+main share it), got %v", result.Compose.Volumes)
+	}
+	initVols := result.Compose.Services["app-config-gen"].Volumes
+	mainVols := result.Compose.Services["app"].Volumes
+	wantInitMount := "app-config:/out"
+	wantMainMount := "app-config:/etc/app"
+	hasInit := false
+	for _, v := range initVols {
+		if v == wantInitMount {
+			hasInit = true
+		}
+	}
+	hasMain := false
+	for _, v := range mainVols {
+		if v == wantMainMount {
+			hasMain = true
+		}
+	}
+	if !hasInit || !hasMain {
+		t.Errorf("shared volume should appear with the right paths in both services\n  init wants %q in %v\n  main wants %q in %v",
+			wantInitMount, initVols, wantMainMount, mainVols)
+	}
+}
+
 // TestConvert_NoSidecarsForSingleContainer is the regression guard:
 // pods with one container shouldn't gain any sidecar services or
 // network_mode tweaks.
