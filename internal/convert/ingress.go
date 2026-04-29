@@ -49,6 +49,13 @@ func buildProxy(
 	byHost := map[string][]route{}
 
 	for _, ing := range ingresses {
+		if isEphemeralIngress(ing) {
+			// cert-manager HTTP-01 solvers and similar ephemeral
+			// infrastructure ingresses don't belong in a local dev stack —
+			// they exist for ~1 minute during cert renewal and reference
+			// services that disappear with them. Skip silently.
+			continue
+		}
 		for _, rule := range ing.Spec.Rules {
 			host := rule.Host
 			if host == "" {
@@ -229,6 +236,46 @@ func localHostFor(host string) string {
 		return host[:i] + ".localhost"
 	}
 	return host + ".localhost"
+}
+
+// isEphemeralIngress recognizes Ingresses that exist only as part of
+// cluster infrastructure (cert-manager HTTP-01 solvers being the
+// near-universal example) and shouldn't appear in a local dev stack.
+//
+// We match on three signals so the filter survives different
+// cert-manager versions and label-vs-annotation conventions:
+//
+//   - the standard cert-manager label/annotation
+//     `acme.cert-manager.io/http01-solver: "true"`
+//   - the "cm-acme-http-solver-" name prefix that cert-manager always
+//     uses for these resources
+//   - any rule whose path starts with `/.well-known/acme-challenge/`
+//     (Let's Encrypt's protocol-level marker — only solvers use it)
+//
+// Any one match is enough. Three independent signals means a
+// cert-manager rename or label drift in a future version still gets
+// caught.
+func isEphemeralIngress(ing kube.Ingress) bool {
+	if ing.Metadata.Annotations["acme.cert-manager.io/http01-solver"] == "true" {
+		return true
+	}
+	if ing.Metadata.Labels["acme.cert-manager.io/http01-solver"] == "true" {
+		return true
+	}
+	if strings.HasPrefix(ing.Metadata.Name, "cm-acme-http-solver-") {
+		return true
+	}
+	for _, rule := range ing.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, p := range rule.HTTP.Paths {
+			if strings.HasPrefix(p.Path, "/.well-known/acme-challenge/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // stripBackendPorts clears the Ports field for each compose service that

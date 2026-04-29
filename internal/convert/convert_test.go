@@ -371,6 +371,95 @@ func TestConvert_Ingress_MissingBackendWarns(t *testing.T) {
 	}
 }
 
+// TestConvert_Ingress_FiltersCertManagerSolvers verifies cert-manager's
+// ephemeral HTTP-01 solver Ingresses are dropped from the generated
+// proxy without a noisy warning. These exist for ~1 minute during cert
+// issuance/renewal and reference Services that don't outlive them — so
+// in any cluster with cert-manager you'd otherwise get useless warnings
+// every time you ran localk during a renewal cycle.
+//
+// Three independent recognition signals so the filter survives
+// cert-manager rename / label drift: annotation, name prefix, and path
+// prefix. Each one alone should be enough to skip the rule.
+func TestConvert_Ingress_FiltersCertManagerSolvers(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{
+			deploymentWithPort("api", 80, map[string]string{"app": "api"}),
+		},
+		Services: []kube.Service{
+			serviceFor("api", 80, map[string]string{"app": "api"}),
+		},
+		Ingresses: []kube.Ingress{
+			// Real ingress — should make it through.
+			{
+				Metadata: kube.ObjectMeta{Name: "web"},
+				Spec: kube.IngressSpec{Rules: []kube.IngressRule{{
+					Host: "app.example.com",
+					HTTP: &kube.IngressRuleHTTP{Paths: []kube.IngressPath{
+						{Path: "/", Backend: backendOn("api", 80)},
+					}},
+				}}},
+			},
+			// Solver via annotation — skip.
+			{
+				Metadata: kube.ObjectMeta{
+					Name:        "real-name-with-annotation",
+					Annotations: map[string]string{"acme.cert-manager.io/http01-solver": "true"},
+				},
+				Spec: kube.IngressSpec{Rules: []kube.IngressRule{{
+					Host: "app.example.com",
+					HTTP: &kube.IngressRuleHTTP{Paths: []kube.IngressPath{
+						{Path: "/whatever", Backend: backendOn("does-not-exist", 80)},
+					}},
+				}}},
+			},
+			// Solver via cm-acme-http-solver- name prefix — skip.
+			{
+				Metadata: kube.ObjectMeta{Name: "cm-acme-http-solver-abc12"},
+				Spec: kube.IngressSpec{Rules: []kube.IngressRule{{
+					Host: "app.example.com",
+					HTTP: &kube.IngressRuleHTTP{Paths: []kube.IngressPath{
+						{Path: "/.well-known/acme-challenge/x", Backend: backendOn("missing", 80)},
+					}},
+				}}},
+			},
+			// Solver via path prefix — skip even if name and labels look
+			// innocuous.
+			{
+				Metadata: kube.ObjectMeta{Name: "weirdly-named"},
+				Spec: kube.IngressSpec{Rules: []kube.IngressRule{{
+					Host: "app.example.com",
+					HTTP: &kube.IngressRuleHTTP{Paths: []kube.IngressPath{
+						{Path: "/.well-known/acme-challenge/token", Backend: backendOn("nope", 80)},
+					}},
+				}}},
+			},
+		},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	// Real ingress survives.
+	if !strings.Contains(result.CaddyFile, "reverse_proxy api:80") {
+		t.Errorf("real ingress should have produced a route; Caddyfile:\n%s", result.CaddyFile)
+	}
+	// None of the solver-targeted backend names leaked in.
+	for _, leaked := range []string{"does-not-exist", "missing", "nope"} {
+		if strings.Contains(result.CaddyFile, leaked) {
+			t.Errorf("solver backend %q leaked into Caddyfile:\n%s", leaked, result.CaddyFile)
+		}
+	}
+	// And no noisy "missing backend" warning for those skipped solvers —
+	// the whole point of the filter is to avoid the noise.
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "does-not-exist") || strings.Contains(w, "missing") || strings.Contains(w, "nope") {
+			t.Errorf("solver should be filtered silently; got warning: %s", w)
+		}
+	}
+}
+
 // TestConvert_NoIngress_NoProxy is the regression guard: when there are no
 // Ingresses, no proxy service is emitted and CaddyFile is empty. We don't
 // want to surprise users with a proxy container that doesn't do anything.

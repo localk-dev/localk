@@ -401,6 +401,14 @@ behind any Ingress (databases, message queues, observability stacks)
 keep their host port mappings so you can still hit them directly with
 your dev tools.
 
+**cert-manager noise filtered.** If your cluster uses cert-manager,
+HTTP-01 ACME challenge Ingresses (`cm-acme-http-solver-...`) get
+generated and torn down for every certificate renewal. They reference
+ephemeral services that don't outlive the challenge. localk recognizes
+them via the standard cert-manager annotation, the
+`cm-acme-http-solver-` name prefix, or the `/.well-known/acme-challenge/`
+path prefix, and skips them silently — no proxy entry, no warning.
+
 ## Configuration: `localk.yaml`
 
 Drop a `localk.yaml` in your repo root to tweak how the local stack is
