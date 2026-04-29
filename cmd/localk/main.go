@@ -22,6 +22,8 @@ const usage = `localk - run your Kubernetes stack locally with one command.
 Usage:
   localk generate <input-dir> [--out-dir <dir>] [-o <file>] [--config <file>] [--dry-run]
   localk generate -k [-n <namespace>] [--context <name>] [-y] [--out-dir <dir>] [--config <file>] [--dry-run]
+  localk up   [--out-dir <dir>] [-f <file>] [--build] [--no-detach] [-- DOCKER_COMPOSE_ARGS...]
+  localk down [--out-dir <dir>] [-f <file>] [-v] [-- DOCKER_COMPOSE_ARGS...]
   localk version
   localk help
 
@@ -31,6 +33,11 @@ looks for ./localk.yaml by default; pass --config to use a different path.
 Commands:
   generate    Convert k8s manifests into a docker-compose.yml.
               Source: a directory of YAML files, or a live cluster via -k.
+  up          Run the generated stack via 'docker compose up' (detached
+              by default). Looks for ./docker-compose.yml unless --out-dir
+              or -f is given.
+  down        Stop the stack via 'docker compose down'. Pass -v to also
+              delete named volumes (DESTRUCTIVE).
   version     Print version and exit.
   help        Print this help and exit.
 
@@ -57,6 +64,10 @@ func main() {
 	switch os.Args[1] {
 	case "generate":
 		runGenerate(os.Args[2:])
+	case "up":
+		runUp(os.Args[2:])
+	case "down":
+		runDown(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("localk", version)
 	case "help", "-h", "--help":

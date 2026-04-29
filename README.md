@@ -61,8 +61,11 @@ localk generate ./k8s/ --out-dir ./build/local
 # Or override the compose filename only
 localk generate ./k8s/ -o compose.local.yml
 
-# Start the stack
-docker compose -f compose.local.yml up
+# Start the stack (detached by default)
+localk up --out-dir ./build/local
+
+# Stop it
+localk down --out-dir ./build/local
 ```
 
 ### Where files are written
@@ -76,6 +79,44 @@ docker compose -f compose.local.yml up
 So `--out-dir ./build` writes `./build/docker-compose.yml` + `./build/.env`,
 while `--out-dir ./build -o /tmp/foo.yml` puts the compose file at `/tmp/foo.yml`
 and the env file at `./build/.env`.
+
+## Running the stack (`localk up` / `localk down`)
+
+Once you've generated the compose file, you can start and stop the whole stack
+without remembering the path:
+
+```bash
+# Start in the background (detached by default)
+localk up
+
+# Or against a non-default output directory
+localk up --out-dir ./build/local
+
+# Rebuild images first (e.g. after editing localk.yaml `build:` paths)
+localk up --build
+
+# Stay attached to the logs
+localk up --no-detach
+
+# Stop the stack
+localk down
+
+# Stop AND delete named volumes (DESTRUCTIVE — wipes local data)
+localk down -v
+```
+
+Both commands look for `./docker-compose.yml` by default, follow the same
+`--out-dir` / `-f` precedence as `generate`, and pass through any args after
+`--` directly to `docker compose`:
+
+```bash
+localk up   -- --remove-orphans
+localk down -- --timeout 5
+```
+
+`up` and `down` shell out to `docker compose` (the v2 plugin). They never
+regenerate the compose file — that's always `localk generate`'s job — so a
+failure points clearly at one side or the other.
 
 ## Previewing the output (`--dry-run`)
 
