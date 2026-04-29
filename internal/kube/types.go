@@ -98,8 +98,17 @@ type EnvVar struct {
 }
 
 type EnvVarSource struct {
-	ConfigMapKeyRef *KeyRef `yaml:"configMapKeyRef,omitempty"`
-	SecretKeyRef    *KeyRef `yaml:"secretKeyRef,omitempty"`
+	ConfigMapKeyRef *KeyRef         `yaml:"configMapKeyRef,omitempty"`
+	SecretKeyRef    *KeyRef         `yaml:"secretKeyRef,omitempty"`
+	FieldRef        *ObjectFieldRef `yaml:"fieldRef,omitempty"`
+}
+
+// ObjectFieldRef is the downward-API selector — k8s pods can read their own
+// metadata into env vars via this ref. Locally we resolve well-known paths
+// (metadata.name, metadata.namespace, status.podIP, ...) to sensible
+// defaults so manifests that depend on the downward API don't break.
+type ObjectFieldRef struct {
+	FieldPath string `yaml:"fieldPath"`
 }
 
 type KeyRef struct {

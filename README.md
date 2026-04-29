@@ -251,6 +251,28 @@ applies to `StatefulSet`s: each `volumeClaimTemplate` becomes a named
 compose volume prefixed with the workload name, so two stateful services
 that both call their data volume "data" don't collide.
 
+### Downward API
+
+k8s manifests routinely declare env vars from the downward API
+(`valueFrom: fieldRef: { fieldPath: metadata.name }` etc) and reference
+them in other env vars via `$(VAR_NAME)` — Bitnami's MongoDB and
+RabbitMQ charts are the classic examples. localk resolves the common
+field paths to local equivalents and expands `$(VAR_NAME)` references
+against earlier env entries, in declaration order, matching kubelet's
+expansion behavior:
+
+| fieldPath                 | local value                                      |
+|---------------------------|--------------------------------------------------|
+| `metadata.name`           | the workload's compose service name              |
+| `metadata.namespace`      | `default`                                        |
+| `metadata.uid`            | `<service>-local`                                |
+| `status.podIP` / `status.hostIP` | the workload's compose service name       |
+| `spec.nodeName`           | `docker-host`                                    |
+| `spec.serviceAccountName` | `default`                                        |
+
+Unrecognized field paths (e.g. `metadata.labels['team']`) leave the env
+var unset and emit a warning.
+
 ### Ingress → Caddy
 
 When the input includes one or more `Ingress` resources, localk emits an

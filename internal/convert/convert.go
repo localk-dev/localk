@@ -280,10 +280,26 @@ func convertPod(
 		}
 	}
 
+	// Walk env entries in declaration order so $(VAR) references inside a
+	// later value can resolve against earlier env vars (the same semantics
+	// k8s applies at pod startup).
 	for _, e := range c.Env {
 		switch {
 		case e.ValueFrom == nil:
-			env[e.Name] = e.Value
+			// Literal value — substitute any $(VAR) refs against earlier
+			// env entries we've already resolved. Matches kubelet's
+			// expansion behavior.
+			env[e.Name] = expandRefs(e.Value, env)
+		case e.ValueFrom.FieldRef != nil:
+			v, ok := resolveFieldRef(e.ValueFrom.FieldRef.FieldPath, w)
+			if !ok {
+				warnings = append(warnings, fmt.Sprintf(
+					"env %q in %s %q uses fieldPath %q which has no local equivalent; leaving unset",
+					e.Name, w.kindLabel, w.name, e.ValueFrom.FieldRef.FieldPath,
+				))
+				continue
+			}
+			env[e.Name] = v
 		case e.ValueFrom.ConfigMapKeyRef != nil:
 			ref := e.ValueFrom.ConfigMapKeyRef
 			cm := m.FindConfigMap(ref.Name)

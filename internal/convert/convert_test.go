@@ -435,6 +435,97 @@ func TestConvert_Ingress_LocalHostMapping(t *testing.T) {
 	}
 }
 
+// TestConvert_DownwardAPIExpansion is the end-to-end version of the
+// downward.go unit tests. It mirrors the real-world Bitnami MongoDB
+// shape: declare POD_NAME via fieldRef, then reference $(POD_NAME) in
+// MONGODB_ADVERTISED_HOSTNAME. Before this fix, the fieldRef env var
+// was silently dropped AND the $(POD_NAME) reference was left literal,
+// breaking replica advertisement locally.
+func TestConvert_DownwardAPIExpansion(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "mongodb"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "mongodb"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "mongodb"}},
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{{
+							Name:  "mongodb",
+							Image: "bitnami/mongodb:latest",
+							Env: []kube.EnvVar{
+								{Name: "MY_POD_NAME", ValueFrom: &kube.EnvVarSource{FieldRef: &kube.ObjectFieldRef{FieldPath: "metadata.name"}}},
+								{Name: "MY_POD_NAMESPACE", ValueFrom: &kube.EnvVarSource{FieldRef: &kube.ObjectFieldRef{FieldPath: "metadata.namespace"}}},
+								{Name: "MONGODB_ADVERTISED_HOSTNAME", Value: "$(MY_POD_NAME).mongodb-headless.$(MY_POD_NAMESPACE).svc.cluster.local"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	mongo := result.Compose.Services["mongodb"]
+
+	if got := mongo.Environment["MY_POD_NAME"]; got != "mongodb" {
+		t.Errorf("MY_POD_NAME = %q, want mongodb (was likely dropped before this fix)", got)
+	}
+	if got := mongo.Environment["MY_POD_NAMESPACE"]; got != "default" {
+		t.Errorf("MY_POD_NAMESPACE = %q, want default", got)
+	}
+	want := "mongodb.mongodb-headless.default.svc.cluster.local"
+	if got := mongo.Environment["MONGODB_ADVERTISED_HOSTNAME"]; got != want {
+		t.Errorf("MONGODB_ADVERTISED_HOSTNAME not expanded:\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestConvert_DownwardAPIUnknownPathWarns verifies that fieldPaths we
+// don't know how to map produce a clear warning rather than silently
+// dropping the env var.
+func TestConvert_DownwardAPIUnknownPathWarns(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "app:latest",
+							Env: []kube.EnvVar{
+								{Name: "WEIRD", ValueFrom: &kube.EnvVarSource{FieldRef: &kube.ObjectFieldRef{FieldPath: "metadata.labels['team']"}}},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if _, present := result.Compose.Services["app"].Environment["WEIRD"]; present {
+		t.Error("unsupported fieldPath should leave the env var unset, not silently fabricate")
+	}
+	found := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "metadata.labels['team']") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning about unsupported fieldPath, got %v", result.Warnings)
+	}
+}
+
 // Test helpers — kept here so they're easy to find next to the tests
 // that use them.
 

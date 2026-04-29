@@ -130,13 +130,13 @@ func runGenerate(args []string) {
 		if err != nil {
 			fail("parsing %s: %v", inputDir, err)
 		}
-		if len(manifests.Deployments) == 0 {
-			fail("no Deployments found under %s. localk needs at least one Deployment to generate a compose file.", inputDir)
+		if !hasWorkloads(manifests) {
+			fail("no Deployments or StatefulSets found under %s. localk needs at least one workload to generate a compose file.", inputDir)
 		}
 	}
 
-	if *fromCluster && len(manifests.Deployments) == 0 {
-		fail("no Deployments found in namespace %q (context %q). Pick a namespace that contains at least one Deployment.",
+	if *fromCluster && !hasWorkloads(manifests) {
+		fail("no Deployments or StatefulSets found in namespace %q (context %q). Pick a namespace that contains at least one workload.",
 			displayNamespace(*namespace), displayContext(*kubeContext))
 	}
 
@@ -371,6 +371,13 @@ func stdinIsTerminal() bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// hasWorkloads reports whether the parsed input has at least one
+// Deployment or StatefulSet to convert. Without one of these, there's
+// nothing to put in the compose file.
+func hasWorkloads(m *kube.Manifests) bool {
+	return len(m.Deployments) > 0 || len(m.StatefulSets) > 0
 }
 
 func displayNamespace(n string) string {
