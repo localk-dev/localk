@@ -4,10 +4,12 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/goccy/go-yaml"
 
+	"github.com/localk-dev/localk/internal/config"
 	"github.com/localk-dev/localk/internal/convert"
 	"github.com/localk-dev/localk/internal/kube"
 )
@@ -23,7 +25,7 @@ func TestConvert_SimpleExample(t *testing.T) {
 		t.Fatalf("ParseDir: %v", err)
 	}
 
-	result, err := convert.Convert(manifests)
+	result, err := convert.Convert(manifests, nil)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -73,7 +75,7 @@ func TestConvert_HostnamePreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseDir: %v", err)
 	}
-	result, err := convert.Convert(manifests)
+	result, err := convert.Convert(manifests, nil)
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
@@ -84,5 +86,94 @@ func TestConvert_HostnamePreserved(t *testing.T) {
 	}
 	if got := worker.Environment["API_URL"]; got != "http://api:3000" {
 		t.Errorf("expected worker.API_URL to remain http://api:3000, got %q", got)
+	}
+}
+
+func TestConvert_OverrideSkip(t *testing.T) {
+	manifests, err := kube.ParseDir("../../examples/simple/k8s")
+	if err != nil {
+		t.Fatalf("ParseDir: %v", err)
+	}
+	cfg := &config.Config{Services: map[string]config.ServiceOverride{
+		"worker": {Skip: true},
+	}}
+	result, err := convert.Convert(manifests, cfg)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if _, present := result.Compose.Services["worker"]; present {
+		t.Error("expected worker to be skipped, but it appeared in the compose output")
+	}
+	if _, present := result.Compose.Services["api"]; !present {
+		t.Error("api should still be present when only worker is skipped")
+	}
+}
+
+func TestConvert_OverrideImage(t *testing.T) {
+	manifests, err := kube.ParseDir("../../examples/simple/k8s")
+	if err != nil {
+		t.Fatalf("ParseDir: %v", err)
+	}
+	cfg := &config.Config{Services: map[string]config.ServiceOverride{
+		"postgres": {Image: "postgres:15-alpine"},
+	}}
+	result, err := convert.Convert(manifests, cfg)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	pg := result.Compose.Services["postgres"]
+	if pg.Image != "postgres:15-alpine" {
+		t.Errorf("expected image override, got %q", pg.Image)
+	}
+	if pg.Build != nil {
+		t.Errorf("Image override should leave Build nil, got %+v", pg.Build)
+	}
+}
+
+func TestConvert_OverrideBuild(t *testing.T) {
+	manifests, err := kube.ParseDir("../../examples/simple/k8s")
+	if err != nil {
+		t.Fatalf("ParseDir: %v", err)
+	}
+	cfg := &config.Config{Services: map[string]config.ServiceOverride{
+		"api": {Build: &config.BuildOverride{Context: "./services/api", Dockerfile: "Dockerfile.dev"}},
+	}}
+	result, err := convert.Convert(manifests, cfg)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	api := result.Compose.Services["api"]
+	if api.Image != "" {
+		t.Errorf("Build override should clear Image, got %q", api.Image)
+	}
+	if api.Build == nil {
+		t.Fatal("expected Build to be set")
+	}
+	if api.Build.Context != "./services/api" || api.Build.Dockerfile != "Dockerfile.dev" {
+		t.Errorf("Build = %+v, want {./services/api, Dockerfile.dev}", api.Build)
+	}
+}
+
+func TestConvert_OverrideUnknownServiceWarns(t *testing.T) {
+	manifests, err := kube.ParseDir("../../examples/simple/k8s")
+	if err != nil {
+		t.Fatalf("ParseDir: %v", err)
+	}
+	cfg := &config.Config{Services: map[string]config.ServiceOverride{
+		"nonexistent": {Skip: true},
+	}}
+	result, err := convert.Convert(manifests, cfg)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	found := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "nonexistent") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning about unmatched override, got warnings: %v", result.Warnings)
 	}
 }

@@ -77,7 +77,7 @@ func runGenerate(args []string) {
 		fail("no Deployments found under %s. localk needs at least one Deployment to generate a compose file.", inputDir)
 	}
 
-	result, err := convert.Convert(manifests)
+	result, err := convert.Convert(manifests, nil)
 	if err != nil {
 		fail("converting manifests: %v", err)
 	}

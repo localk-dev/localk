@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/localk-dev/localk/internal/compose"
+	"github.com/localk-dev/localk/internal/config"
 	"github.com/localk-dev/localk/internal/kube"
 )
 
@@ -22,8 +23,10 @@ type Result struct {
 	Warnings []string
 }
 
-// Convert translates the given Manifests bundle into a Result.
-func Convert(m *kube.Manifests) (*Result, error) {
+// Convert translates the given Manifests bundle into a Result. The optional
+// cfg applies per-service overrides (skip, image, build) loaded from
+// localk.yaml; pass nil for "no overrides".
+func Convert(m *kube.Manifests, cfg *config.Config) (*Result, error) {
 	res := &Result{
 		Compose: &compose.File{
 			Services: map[string]compose.Service{},
@@ -41,15 +44,37 @@ func Convert(m *kube.Manifests) (*Result, error) {
 	envFileLines := []string{}
 	envFileSeen := map[string]bool{}
 
+	// Track which override entries actually matched a deployment, so we can
+	// warn about typos / stale entries at the end.
+	overrideHits := map[string]bool{}
+
 	for _, dep := range m.Deployments {
+		name := serviceName(&dep, m)
+		override := cfg.ServiceOverrideFor(name)
+		if override.Skip || override.Image != "" || override.Build != nil {
+			overrideHits[name] = true
+		}
+		if override.Skip {
+			continue
+		}
+
 		svc, depWarnings, err := convertDeployment(&dep, m, declaredVolumes, res.Compose, &envFileLines, envFileSeen)
 		if err != nil {
 			return nil, err
 		}
 		res.Warnings = append(res.Warnings, depWarnings...)
 
-		name := serviceName(&dep, m)
+		applyServiceOverride(&svc, override)
 		res.Compose.Services[name] = svc
+	}
+
+	for name := range cfg.ServiceNames() {
+		if !overrideHits[name] {
+			res.Warnings = append(res.Warnings, fmt.Sprintf(
+				"localk.yaml: override for service %q did not match any Deployment in the input. Typo or stale entry?",
+				name,
+			))
+		}
 	}
 
 	if len(envFileLines) > 0 {
@@ -59,6 +84,24 @@ func Convert(m *kube.Manifests) (*Result, error) {
 	}
 
 	return res, nil
+}
+
+// applyServiceOverride mutates svc in-place to reflect the user's localk.yaml
+// settings. The override fields are mutually compatible — image and build
+// both clear the other (build wins if both are set, but the config layer
+// could reject that in the future).
+func applyServiceOverride(svc *compose.Service, ov config.ServiceOverride) {
+	if ov.Image != "" {
+		svc.Image = ov.Image
+		svc.Build = nil
+	}
+	if ov.Build != nil {
+		svc.Image = ""
+		svc.Build = &compose.Build{
+			Context:    ov.Build.Context,
+			Dockerfile: ov.Build.Dockerfile,
+		}
+	}
 }
 
 // serviceName decides what to call a deployment in the compose file. We prefer
