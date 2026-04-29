@@ -239,6 +239,243 @@ func TestConvert_StatefulSet(t *testing.T) {
 	}
 }
 
+// TestConvert_Ingress_PathRouting exercises the realistic mp-production
+// shape: one host, multiple Prefix paths, each routing to a different
+// backend service. We assert (a) a proxy service is emitted, (b) the
+// Caddyfile has handle_path entries for each prefix, (c) all backends
+// have their host-port publishing stripped so they don't collide with
+// the proxy on host:80.
+func TestConvert_Ingress_PathRouting(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{
+			deploymentWithPort("ui-admin", 80, map[string]string{"app": "ui-admin"}),
+			deploymentWithPort("ui-consent", 80, map[string]string{"app": "ui-consent"}),
+			deploymentWithPort("api", 80, map[string]string{"app": "api"}),
+			deploymentWithPort("postgres", 5432, map[string]string{"app": "postgres"}), // not behind ingress
+		},
+		Services: []kube.Service{
+			serviceFor("ui-admin", 80, map[string]string{"app": "ui-admin"}),
+			serviceFor("ui-consent", 80, map[string]string{"app": "ui-consent"}),
+			serviceFor("api", 80, map[string]string{"app": "api"}),
+			serviceFor("postgres", 5432, map[string]string{"app": "postgres"}),
+		},
+		Ingresses: []kube.Ingress{{
+			Metadata: kube.ObjectMeta{Name: "web"},
+			Spec: kube.IngressSpec{Rules: []kube.IngressRule{{
+				Host: "example.com",
+				HTTP: &kube.IngressRuleHTTP{Paths: []kube.IngressPath{
+					{Path: "/admin", PathType: "Prefix", Backend: backendOn("ui-admin", 80)},
+					{Path: "/consent", PathType: "Prefix", Backend: backendOn("ui-consent", 80)},
+					{Path: "/api", PathType: "Prefix", Backend: backendOn("api", 80)},
+				}},
+			}}},
+		}},
+	}
+
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	// (a) Proxy service emitted.
+	proxy, ok := result.Compose.Services["proxy"]
+	if !ok {
+		t.Fatal("expected proxy service in compose output")
+	}
+	if proxy.Image != "caddy:2-alpine" {
+		t.Errorf("proxy image = %q, want caddy:2-alpine", proxy.Image)
+	}
+	if len(proxy.Ports) != 1 || proxy.Ports[0] != "80:80" {
+		t.Errorf("proxy ports = %v, want [80:80]", proxy.Ports)
+	}
+
+	// (b) Caddyfile has the right shape.
+	cf := result.CaddyFile
+	if !strings.Contains(cf, "example.localhost {") {
+		t.Errorf("Caddyfile missing host block:\n%s", cf)
+	}
+	for _, want := range []string{
+		"handle_path /admin/* {",
+		"reverse_proxy ui-admin:80",
+		"handle_path /consent/* {",
+		"reverse_proxy ui-consent:80",
+		"handle_path /api/* {",
+		"reverse_proxy api:80",
+	} {
+		if !strings.Contains(cf, want) {
+			t.Errorf("Caddyfile missing %q:\n%s", want, cf)
+		}
+	}
+
+	// (c) Backend ports stripped so they don't collide with the proxy.
+	for _, name := range []string{"ui-admin", "ui-consent", "api"} {
+		s := result.Compose.Services[name]
+		if len(s.Ports) != 0 {
+			t.Errorf("backend %q should have no host ports after ingress strip, got %v", name, s.Ports)
+		}
+	}
+
+	// (d) Non-routed services keep their ports.
+	pg := result.Compose.Services["postgres"]
+	if len(pg.Ports) == 0 {
+		t.Error("postgres is not behind ingress; its host port should NOT be stripped")
+	}
+}
+
+// TestConvert_Ingress_MissingBackendWarns verifies that an Ingress rule
+// pointing at a service that doesn't exist (typo, missing manifest) emits
+// a warning and is skipped, but other rules still produce output.
+func TestConvert_Ingress_MissingBackendWarns(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{
+			deploymentWithPort("api", 80, map[string]string{"app": "api"}),
+		},
+		Services: []kube.Service{
+			serviceFor("api", 80, map[string]string{"app": "api"}),
+		},
+		Ingresses: []kube.Ingress{{
+			Metadata: kube.ObjectMeta{Name: "web"},
+			Spec: kube.IngressSpec{Rules: []kube.IngressRule{{
+				Host: "example.com",
+				HTTP: &kube.IngressRuleHTTP{Paths: []kube.IngressPath{
+					{Path: "/api", PathType: "Prefix", Backend: backendOn("api", 80)},
+					{Path: "/ghost", PathType: "Prefix", Backend: backendOn("nonexistent", 80)},
+				}},
+			}}},
+		}},
+	}
+
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	// The good rule still emits a Caddy entry.
+	if !strings.Contains(result.CaddyFile, "reverse_proxy api:80") {
+		t.Errorf("expected api route to survive missing-backend warning:\n%s", result.CaddyFile)
+	}
+	// The bad rule is skipped — no nonexistent backend in the Caddyfile.
+	if strings.Contains(result.CaddyFile, "nonexistent") {
+		t.Errorf("missing-backend rule should not appear in Caddyfile:\n%s", result.CaddyFile)
+	}
+	found := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "nonexistent") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a warning about the missing backend, got %v", result.Warnings)
+	}
+}
+
+// TestConvert_NoIngress_NoProxy is the regression guard: when there are no
+// Ingresses, no proxy service is emitted and CaddyFile is empty. We don't
+// want to surprise users with a proxy container that doesn't do anything.
+func TestConvert_NoIngress_NoProxy(t *testing.T) {
+	manifests, err := kube.ParseDir("../../examples/simple/k8s")
+	if err != nil {
+		t.Fatalf("ParseDir: %v", err)
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if _, present := result.Compose.Services["proxy"]; present {
+		t.Error("proxy service should not be emitted when there are no Ingresses")
+	}
+	if result.CaddyFile != "" {
+		t.Errorf("CaddyFile should be empty when there are no Ingresses, got %q", result.CaddyFile)
+	}
+}
+
+// TestConvert_Ingress_LocalHostMapping verifies our hostname-rewrite rule:
+// replace the last domain segment with `localhost`. This preserves the
+// subdomain hierarchy that distinguishes services in prod (api.foo.eu vs
+// seq.foo.eu) while ensuring everything resolves to 127.0.0.1 locally
+// without /etc/hosts edits.
+func TestConvert_Ingress_LocalHostMapping(t *testing.T) {
+	cases := []struct {
+		prod, want string
+	}{
+		{"example.com", "example.localhost"},
+		{"api.example.com", "api.example.localhost"},
+		{"seq.example.com", "seq.example.localhost"},
+		{"single", "single.localhost"},
+		{"already.localhost", "already.localhost"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.prod, func(t *testing.T) {
+			manifests := &kube.Manifests{
+				Deployments: []kube.Deployment{
+					deploymentWithPort("api", 80, map[string]string{"app": "api"}),
+				},
+				Services: []kube.Service{
+					serviceFor("api", 80, map[string]string{"app": "api"}),
+				},
+				Ingresses: []kube.Ingress{{
+					Metadata: kube.ObjectMeta{Name: "x"},
+					Spec: kube.IngressSpec{Rules: []kube.IngressRule{{
+						Host: tc.prod,
+						HTTP: &kube.IngressRuleHTTP{Paths: []kube.IngressPath{
+							{Path: "/", Backend: backendOn("api", 80)},
+						}},
+					}}},
+				}},
+			}
+			result, err := convert.Convert(manifests, nil)
+			if err != nil {
+				t.Fatalf("Convert: %v", err)
+			}
+			if !strings.Contains(result.CaddyFile, tc.want+" {") {
+				t.Errorf("expected host block for %q in Caddyfile, got:\n%s", tc.want, result.CaddyFile)
+			}
+		})
+	}
+}
+
+// Test helpers — kept here so they're easy to find next to the tests
+// that use them.
+
+func deploymentWithPort(name string, port int32, labels map[string]string) kube.Deployment {
+	return kube.Deployment{
+		Metadata: kube.ObjectMeta{Name: name},
+		Spec: kube.DeploymentSpec{
+			Selector: kube.LabelSelect{MatchLabels: labels},
+			Template: kube.PodTemplate{
+				Metadata: kube.ObjectMeta{Labels: labels},
+				Spec: kube.PodSpec{
+					Containers: []kube.Container{{
+						Name:  name,
+						Image: name + ":latest",
+						Ports: []kube.ContainerPort{{ContainerPort: port}},
+					}},
+				},
+			},
+		},
+	}
+}
+
+func serviceFor(name string, port int32, selector map[string]string) kube.Service {
+	return kube.Service{
+		Metadata: kube.ObjectMeta{Name: name},
+		Spec: kube.ServiceSpec{
+			Selector: selector,
+			Ports:    []kube.ServicePort{{Port: port}},
+		},
+	}
+}
+
+func backendOn(name string, port int32) kube.IngressBackend {
+	return kube.IngressBackend{
+		Service: kube.IngressServiceBackend{
+			Name: name,
+			Port: kube.IngressServicePort{Number: port},
+		},
+	}
+}
+
 // TestConvert_StatefulSetSkipOverride verifies localk.yaml overrides apply
 // to StatefulSets the same way they do to Deployments.
 func TestConvert_StatefulSetSkipOverride(t *testing.T) {

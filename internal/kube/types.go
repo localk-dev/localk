@@ -221,6 +221,50 @@ type PVCSpec struct {
 	AccessModes      []string `yaml:"accessModes,omitempty"`
 }
 
+// Ingress is a subset of networkingv1.Ingress, modeling host- and
+// path-based HTTP routing. Locally we materialize this as a Caddy reverse
+// proxy that forwards <host>/<path> to the named compose service on the
+// shared compose network.
+type Ingress struct {
+	APIVersion string      `yaml:"apiVersion"`
+	Kind       string      `yaml:"kind"`
+	Metadata   ObjectMeta  `yaml:"metadata"`
+	Spec       IngressSpec `yaml:"spec"`
+}
+
+type IngressSpec struct {
+	Rules []IngressRule `yaml:"rules,omitempty"`
+}
+
+type IngressRule struct {
+	Host string           `yaml:"host,omitempty"`
+	HTTP *IngressRuleHTTP `yaml:"http,omitempty"`
+}
+
+type IngressRuleHTTP struct {
+	Paths []IngressPath `yaml:"paths"`
+}
+
+type IngressPath struct {
+	Path     string         `yaml:"path,omitempty"`
+	PathType string         `yaml:"pathType,omitempty"`
+	Backend  IngressBackend `yaml:"backend"`
+}
+
+type IngressBackend struct {
+	Service IngressServiceBackend `yaml:"service"`
+}
+
+type IngressServiceBackend struct {
+	Name string             `yaml:"name"`
+	Port IngressServicePort `yaml:"port"`
+}
+
+type IngressServicePort struct {
+	Number int32  `yaml:"number,omitempty"`
+	Name   string `yaml:"name,omitempty"`
+}
+
 // Manifests is the bundle of resources parsed out of an input directory.
 type Manifests struct {
 	Deployments  []Deployment
@@ -229,4 +273,5 @@ type Manifests struct {
 	ConfigMaps   []ConfigMap
 	Secrets      []Secret
 	PVCs         []PersistentVolumeClaim
+	Ingresses    []Ingress
 }

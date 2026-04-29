@@ -148,6 +148,12 @@ func dispatchDoc(doc []byte, m *Manifests) error {
 			return fmt.Errorf("decoding PVC: %w", err)
 		}
 		m.PVCs = append(m.PVCs, p)
+	case "Ingress":
+		var ing Ingress
+		if err := yaml.Unmarshal(doc, &ing); err != nil {
+			return fmt.Errorf("decoding Ingress: %w", err)
+		}
+		m.Ingresses = append(m.Ingresses, ing)
 	default:
 		// Silently ignore unsupported kinds for now.
 	}

@@ -124,6 +124,54 @@ items:
 	}
 }
 
+// TestParseBytes_Ingress verifies Ingress resources are dispatched into
+// Manifests.Ingresses with their host/path/backend structure intact.
+func TestParseBytes_Ingress(t *testing.T) {
+	data := strings.TrimSpace(`
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+spec:
+  rules:
+  - host: example.com
+    http:
+      paths:
+      - path: /admin
+        pathType: Prefix
+        backend:
+          service:
+            name: ui-admin
+            port:
+              number: 80
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api
+            port:
+              number: 80
+`)
+	m, err := ParseBytes([]byte(data))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	if len(m.Ingresses) != 1 {
+		t.Fatalf("expected 1 Ingress, got %d", len(m.Ingresses))
+	}
+	rules := m.Ingresses[0].Spec.Rules
+	if len(rules) != 1 || rules[0].Host != "example.com" {
+		t.Fatalf("unexpected rules shape: %+v", rules)
+	}
+	if rules[0].HTTP == nil || len(rules[0].HTTP.Paths) != 2 {
+		t.Fatalf("expected 2 paths, got %+v", rules[0].HTTP)
+	}
+	p := rules[0].HTTP.Paths[0]
+	if p.Path != "/admin" || p.PathType != "Prefix" || p.Backend.Service.Name != "ui-admin" || p.Backend.Service.Port.Number != 80 {
+		t.Errorf("first path didn't round-trip: %+v", p)
+	}
+}
+
 // TestParseBytes_StatefulSet verifies StatefulSets land in the right slice
 // and their volumeClaimTemplates survive parsing intact — that's the
 // distinguishing feature of a StatefulSet vs a Deployment.

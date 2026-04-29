@@ -158,8 +158,10 @@ func runGenerate(args []string) {
 		}
 	}
 
+	caddyPath := resolveOutPath(*outDir, "Caddyfile")
+
 	if *dryRun {
-		printDryRun(composePath, composeOut, envPath, envContents, len(result.Compose.Services))
+		printDryRun(composePath, composeOut, envPath, envContents, caddyPath, result.CaddyFile, len(result.Compose.Services))
 		for _, w := range result.Warnings {
 			fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 		}
@@ -182,12 +184,24 @@ func runGenerate(args []string) {
 			fail("writing %s: %v", envPath, err)
 		}
 	}
+	if result.CaddyFile != "" {
+		if err := ensureParentDir(caddyPath); err != nil {
+			fail("preparing output directory for %s: %v", caddyPath, err)
+		}
+		if err := writeFile(caddyPath, []byte(result.CaddyFile)); err != nil {
+			fail("writing %s: %v", caddyPath, err)
+		}
+	}
 
 	abs, _ := filepath.Abs(composePath)
 	fmt.Printf("Wrote %s (%d services)\n", abs, len(result.Compose.Services))
 	if envContents != "" {
 		envAbs, _ := filepath.Abs(envPath)
 		fmt.Printf("Wrote %s with secret-derived env vars. Review before sharing.\n", envAbs)
+	}
+	if result.CaddyFile != "" {
+		caddyAbs, _ := filepath.Abs(caddyPath)
+		fmt.Printf("Wrote %s for the Caddy reverse proxy.\n", caddyAbs)
 	}
 
 	for _, w := range result.Warnings {
@@ -219,10 +233,11 @@ func ensureParentDir(path string) error {
 	return os.MkdirAll(dir, 0o755)
 }
 
-// printDryRun streams the compose file and a redacted version of the .env
-// file to stdout, prefixed by "would write" markers, so the user can see the
-// full output without secrets ending up in their terminal scrollback.
-func printDryRun(composePath string, composeOut []byte, envPath, envContents string, serviceCount int) {
+// printDryRun streams the compose file, a redacted version of the .env
+// file, and the Caddyfile to stdout, prefixed by "would write" markers, so
+// the user can see the full output without secrets ending up in their
+// terminal scrollback.
+func printDryRun(composePath string, composeOut []byte, envPath, envContents, caddyPath, caddyContents string, serviceCount int) {
 	composeAbs, _ := filepath.Abs(composePath)
 	fmt.Printf("--- DRY RUN: would write %s (%d services) ---\n", composeAbs, serviceCount)
 	os.Stdout.Write(composeOut)
@@ -235,6 +250,16 @@ func printDryRun(composePath string, composeOut []byte, envPath, envContents str
 		fmt.Println()
 		fmt.Printf("--- DRY RUN: would write %s (values redacted) ---\n", envAbs)
 		fmt.Println(redactEnvFile(envContents))
+	}
+
+	if caddyContents != "" {
+		caddyAbs, _ := filepath.Abs(caddyPath)
+		fmt.Println()
+		fmt.Printf("--- DRY RUN: would write %s ---\n", caddyAbs)
+		fmt.Print(caddyContents)
+		if !strings.HasSuffix(caddyContents, "\n") {
+			fmt.Println()
+		}
 	}
 }
 

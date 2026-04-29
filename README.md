@@ -84,7 +84,7 @@ written, without touching disk:
 
 ```bash
 localk generate ./k8s/ --dry-run
-localk generate -k -n maalerportal --dry-run
+localk generate -k -n my-namespace --dry-run
 ```
 
 The compose YAML is printed in full so you can verify shape, image tags,
@@ -119,18 +119,18 @@ from your cluster via `kubectl`:
 localk generate -k
 
 # Pin a specific namespace
-localk generate -k -n maalerportal
+localk generate -k -n my-namespace
 
 # Pin both context and namespace, skip confirmation (CI / scripts)
-localk generate -k --context staging -n maalerportal -y
+localk generate -k --context staging -n my-namespace -y
 ```
 
 Before any cluster call, localk prints the resolved context and namespace
 and asks you to confirm:
 
 ```
-Cluster context: maalerportal-prod
-Namespace:       maalerportal
+Cluster context: my-namespace-prod
+Namespace:       my-namespace
 Pulling (read-only): Deployments, Services, ConfigMaps, Secrets, PVCs
 localk only invokes `kubectl get` and `kubectl config view`.
 It never modifies, creates, or deletes anything in the cluster.
@@ -167,13 +167,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: localk-readonly
-  namespace: maalerportal
+  namespace: my-namespace
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: localk-readonly-view
-  namespace: maalerportal
+  namespace: my-namespace
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -181,7 +181,7 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: localk-readonly
-  namespace: maalerportal
+  namespace: my-namespace
 ```
 
 Apply that, then build a kubeconfig context from the ServiceAccount's token
@@ -201,7 +201,7 @@ docker-compose constructs:
 | `ConfigMap`             | `environment` entries / mounted files               |
 | `Secret`                | `.env` entries (with warning)                       |
 | `PersistentVolumeClaim` | named `volume`                                      |
-| `Ingress`               | (planned) Traefik container with routing            |
+| `Ingress`               | `caddy` reverse proxy + generated `Caddyfile`       |
 
 A `Deployment` named `api` and a `Service` named `api` are merged into one
 compose service called `api`. Other services in the stack can reach it at
@@ -209,6 +209,49 @@ compose service called `api`. Other services in the stack can reach it at
 applies to `StatefulSet`s: each `volumeClaimTemplate` becomes a named
 compose volume prefixed with the workload name, so two stateful services
 that both call their data volume "data" don't collide.
+
+### Ingress → Caddy
+
+When the input includes one or more `Ingress` resources, localk emits an
+extra `proxy` compose service running [Caddy](https://caddyserver.com)
+plus a generated `Caddyfile` next to your compose file. Caddy publishes
+host port 80 and forwards traffic to the right backend service based on
+host and path.
+
+```text
+# in your k8s manifests:
+- host: app.example.com
+  http:
+    paths:
+    - path: /admin
+      pathType: Prefix
+      backend: { service: { name: ui-admin, port: { number: 80 } } }
+    - path: /api
+      pathType: Prefix
+      backend: { service: { name: api, port: { number: 80 } } }
+```
+
+…produces a Caddyfile that routes `http://app.example.localhost/admin` to
+`ui-admin:80` and `http://app.example.localhost/api` to `api:80`.
+
+**Hostname mapping.** Production hosts are rewritten by replacing the
+last domain segment with `localhost` — `app.example.com` becomes
+`app.example.localhost`. `*.localhost` resolves to `127.0.0.1` on every
+major OS, so no `/etc/hosts` edits are needed.
+
+**Path types.** `Prefix` (and unset) maps to Caddy `handle_path`, which
+strips the prefix before forwarding (so `/api/users` reaches the backend
+as `/users`). `Exact` maps to `handle` with no wildcard.
+
+**Backend port collisions, fixed.** When a service is referenced as an
+Ingress backend, localk strips its host-port publishing in the compose
+output. This avoids the very common case where many k8s services serve
+on container :80, and `docker compose up` would otherwise fail with port
+collisions on host:80. Backends remain reachable through the proxy and
+via intra-compose DNS for service-to-service traffic. Services *not*
+behind any Ingress (databases, message queues, observability stacks)
+keep their host port mappings so you can still hit them directly with
+your dev tools.
 
 ## Configuration: `localk.yaml`
 
@@ -275,10 +318,10 @@ localk generate ./k8s/ --config localk.staging.yaml
 ## Status
 
 Early. Currently supports `Deployment`, `StatefulSet`, `Service`,
-`ConfigMap`, `Secret`, and `PersistentVolumeClaim` — both from a directory
-of YAML files and from a live cluster via `localk generate -k`. Per-service
-overrides via `localk.yaml`. Ingress (Traefik), Helm template support, and
-Kustomize are on the roadmap.
+`ConfigMap`, `Secret`, `PersistentVolumeClaim`, and `Ingress` (via a
+generated Caddy reverse proxy) — both from a directory of YAML files and
+from a live cluster via `localk generate -k`. Per-service overrides via
+`localk.yaml`. Helm template support and Kustomize are on the roadmap.
 
 ## License
 
