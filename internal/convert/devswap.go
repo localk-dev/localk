@@ -353,7 +353,12 @@ func standaloneMongo(svc *compose.Service, lookup envLookup) {
 		svc.Environment["MONGO_INITDB_ROOT_PASSWORD"] = pass
 		lookup.addToEnvFile("MONGO_INITDB_ROOT_PASSWORD", pass)
 	}
-	stripPrefixes(svc.Environment, "MONGODB_", "MY_POD_", "K8S_", "BITNAMI_")
+	// Keep ONLY env keys vanilla mongo:7 understands. Bitnami
+	// charts ship a long tail of chart-internal vars
+	// (ALLOW_EMPTY_PASSWORD, OPENSSL_FIPS, K8S_SERVICE_NAME, …)
+	// that don't share a single prefix; an allow-list is more
+	// robust than chasing prefixes one by one.
+	keepOnly(svc.Environment, "MONGO_INITDB_ROOT_USERNAME", "MONGO_INITDB_ROOT_PASSWORD", "MONGO_INITDB_DATABASE")
 	// Drop every chart-specific mount: /bitnami umbrella, the
 	// /opt/bitnami runtime layout, plus the scratch dirs Bitnami
 	// uses (/tmp bind, /.mongodb bind, setup-script bind). Vanilla
@@ -388,17 +393,9 @@ func standaloneRabbit(svc *compose.Service, lookup envLookup) {
 		svc.Environment["RABBITMQ_DEFAULT_PASS"] = pass
 		lookup.addToEnvFile("RABBITMQ_DEFAULT_PASS", pass)
 	}
-	// Drop Bitnami-specific RABBITMQ_* env (everything except the
-	// DEFAULT_USER/PASS we just set). Also drop downward-API and
-	// chart-internal env that the vanilla image has no use for.
-	for k := range svc.Environment {
-		if strings.HasPrefix(k, "RABBITMQ_") &&
-			k != "RABBITMQ_DEFAULT_USER" &&
-			k != "RABBITMQ_DEFAULT_PASS" {
-			delete(svc.Environment, k)
-		}
-	}
-	stripPrefixes(svc.Environment, "MY_POD_", "K8S_", "BITNAMI_")
+	// Allow-list approach matches standaloneMongo's: keep only
+	// the vars the upstream rabbitmq:3-management image documents.
+	keepOnly(svc.Environment, "RABBITMQ_DEFAULT_USER", "RABBITMQ_DEFAULT_PASS", "RABBITMQ_DEFAULT_VHOST")
 	// Drop chart-specific binds (matching standaloneMongo's logic).
 	// Vanilla rabbitmq:3-management has its own /tmp, /etc, plugin
 	// dirs baked into the image; let it use them.
@@ -420,6 +417,23 @@ func stripPrefixes(env map[string]string, prefixes ...string) {
 				delete(env, k)
 				break
 			}
+		}
+	}
+}
+
+// keepOnly removes every env key that isn't in the allow-list.
+// More aggressive than stripPrefixes — the right fit for dev-swap
+// where the vanilla image has a small, documented set of vars and
+// chart-shipped cruft (ALLOW_EMPTY_PASSWORD, OPENSSL_FIPS, …) is
+// strictly noise.
+func keepOnly(env map[string]string, allowed ...string) {
+	keep := make(map[string]bool, len(allowed))
+	for _, k := range allowed {
+		keep[k] = true
+	}
+	for k := range env {
+		if !keep[k] {
+			delete(env, k)
 		}
 	}
 }
