@@ -319,11 +319,19 @@ func buildContainerService(
 		Image:   c.Image,
 		Restart: "unless-stopped",
 	}
+	// k8s command/args are shell strings meant for the container's
+	// runtime to evaluate. Compose, however, runs an interpolation
+	// pass over every string in the YAML at parse time and tries to
+	// substitute `$VAR` / `${VAR}` / `$(cmd)` from its OWN env. To
+	// keep the shell payload intact we escape every `$` to `$$`
+	// (compose's documented escape) so it reaches the container
+	// verbatim and the container's `sh` does the right thing at run
+	// time. Same pattern applied to env values below.
 	if len(c.Command) > 0 {
-		svc.Entrypoint = c.Command
+		svc.Entrypoint = escapeShellArgs(c.Command)
 	}
 	if len(c.Args) > 0 {
-		svc.Command = c.Args
+		svc.Command = escapeShellArgs(c.Args)
 	}
 
 	// --- Environment ---
@@ -405,7 +413,15 @@ func buildContainerService(
 		}
 	}
 	if len(env) > 0 {
-		svc.Environment = env
+		// Compose interpolates `$VAR` / `${VAR}` patterns in env
+		// values at parse time. After expandRefs has resolved any
+		// k8s `$(VAR)` downward-API references, the only `$` left
+		// in a value is meant to reach the container literally —
+		// either it's a shell variable for the container to expand
+		// at runtime (`$XDG_CONFIG_HOME` in nats-box bootstrap), or
+		// it's part of a value (`pass$word`). Both want to survive
+		// compose's interpolation pass, so we double the dollars.
+		svc.Environment = escapeEnvValues(env)
 	}
 
 	// --- Volumes ---
@@ -590,6 +606,44 @@ func normalizeCPU(s string) string {
 		}
 	}
 	return s
+}
+
+// escapeShellArgs doubles every `$` in each element so compose's
+// parse-time variable interpolation leaves the args alone. The
+// escape is compose's own (`$$` → literal `$`); the container's
+// shell never sees the doubled form because compose un-escapes
+// before passing the args to the container.
+func escapeShellArgs(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = escapeDollars(a)
+	}
+	return out
+}
+
+// escapeEnvValues runs the same escape over the values of an env
+// map. Keys are left untouched (env-var names can't contain `$` in
+// any sane setup).
+func escapeEnvValues(env map[string]string) map[string]string {
+	out := make(map[string]string, len(env))
+	for k, v := range env {
+		out[k] = escapeDollars(v)
+	}
+	return out
+}
+
+// escapeDollars replaces every `$` with `$$`. We don't try to be
+// clever about which dollars are "real" shell variables vs. literal
+// — compose treats every `$` as an interpolation trigger, so every
+// `$` we want to pass through needs the escape.
+func escapeDollars(s string) string {
+	if !strings.Contains(s, "$") {
+		return s
+	}
+	return strings.ReplaceAll(s, "$", "$$")
 }
 
 // normalizeMemory converts a k8s memory quantity to a compose-compatible

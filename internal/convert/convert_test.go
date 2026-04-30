@@ -1022,6 +1022,91 @@ func backendOn(name string, port int32) kube.IngressBackend {
 	}
 }
 
+// TestConvert_EscapesDollarsForCompose ensures we double every `$`
+// in env values and command/entrypoint args before they hit
+// docker-compose.yml. Compose interpolates `$VAR` / `${VAR}` at
+// parse time, so anything we want the container's shell to see at
+// runtime — Bitnami/nats-box bootstraps with `$XDG_CONFIG_HOME`,
+// passwords with literal `$`, etc — must reach compose as `$$`.
+//
+// Surfaced by mp-production: nats-box's entrypoint is a literal
+// shell script using $XDG_CONFIG_HOME and $work_dir; without the
+// escape compose prints noisy "variable is not set" warnings on
+// every up.
+func TestConvert_EscapesDollarsForCompose(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "shellish"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "shellish"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "shellish"}},
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{{
+							Name:  "shellish",
+							Image: "alpine",
+							Command: []string{"sh", "-ec", `work_dir="$(pwd)"; cd "$XDG_CONFIG_HOME"`},
+							Args:    []string{"--profile", "$ENV_NAME"},
+							Env: []kube.EnvVar{
+								{Name: "PASSWORD", Value: "pa$$w0rd!"},
+								{Name: "DEPLOY_PATH", Value: "$HOME/app"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	svc := result.Compose.Services["shellish"]
+
+	// Entrypoint (k8s `command:`) gets escaped.
+	wantEntrypoint := []string{"sh", "-ec", `work_dir="$$(pwd)"; cd "$$XDG_CONFIG_HOME"`}
+	if !equalStringSlices(svc.Entrypoint, wantEntrypoint) {
+		t.Errorf("entrypoint not escaped\n  got  %q\n  want %q", svc.Entrypoint, wantEntrypoint)
+	}
+
+	// Command (k8s `args:`) gets escaped.
+	wantCommand := []string{"--profile", "$$ENV_NAME"}
+	if !equalStringSlices(svc.Command, wantCommand) {
+		t.Errorf("command not escaped\n  got  %q\n  want %q", svc.Command, wantCommand)
+	}
+
+	// Env values: round-trip through expandRefs (which treats `$$`
+	// as the k8s escape for a literal `$`) then escapeDollars (which
+	// doubles every remaining `$` for compose). A correctly-escaped
+	// k8s input round-trips to the same string in the compose YAML
+	// — compose's un-escape gets the user back to their intended
+	// literal value at container start.
+	//
+	// Input `pa$$w0rd!` (k8s-escaped `$`) → expandRefs `pa$w0rd!`
+	// (literal) → escapeDollars `pa$$w0rd!` (compose-escaped). ✓
+	if got := svc.Environment["PASSWORD"]; got != `pa$$w0rd!` {
+		t.Errorf("PASSWORD round-trip wrong: got %q, want pa$$w0rd!", got)
+	}
+	// `$HOME` (one `$`, container shell variable) → expandRefs leaves
+	// untouched (no `(` after `$`) → escapeDollars `$$HOME`. Compose
+	// un-escapes to `$HOME`; container's sh expands at runtime.
+	if got := svc.Environment["DEPLOY_PATH"]; got != "$$HOME/app" {
+		t.Errorf("DEPLOY_PATH = %q, want $$HOME/app", got)
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestConvert_MemoryUnits verifies the k8s-to-compose memory unit
 // conversion. Compose rejects k8s binary suffixes (Mi, Gi) — this
 // would crash `docker compose up` on any real-world manifest that
