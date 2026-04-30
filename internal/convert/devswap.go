@@ -186,11 +186,17 @@ func (l envLookup) addToEnvFile(name, value string) {
 //     errors with "already exists" forever. Clear the configs
 //     file before setup runs so each setup is genuinely from
 //     scratch.
-const influxdbSetupGuardCommand = `if [ -s /var/lib/influxdb2/influxd.bolt ] && [ "$DOCKER_INFLUXDB_INIT_MODE" = "setup" ]; then
+// Note the doubled `$$` on every variable expansion: compose
+// runs its own variable interpolation on YAML values and a bare
+// `$VAR` would be substituted with whatever's in the build-time
+// environment (usually empty, breaking the conditional). `$$VAR`
+// is compose's documented escape — it survives interpolation as
+// `$VAR` so the shell sees the variable at runtime.
+const influxdbSetupGuardCommand = `if [ -s /var/lib/influxdb2/influxd.bolt ] && [ "$$DOCKER_INFLUXDB_INIT_MODE" = "setup" ]; then
   echo "[localk] influxdb already initialized; skipping setup mode for this restart"
   unset DOCKER_INFLUXDB_INIT_MODE
 fi
-if [ "$DOCKER_INFLUXDB_INIT_MODE" = "setup" ]; then
+if [ "$$DOCKER_INFLUXDB_INIT_MODE" = "setup" ]; then
   echo "[localk] clearing stale CLI configs in /etc/influxdb2/ before setup"
   rm -f /etc/influxdb2/influx-configs 2>/dev/null || true
 fi
