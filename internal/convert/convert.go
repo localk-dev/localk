@@ -598,7 +598,7 @@ func buildContainerService(
 			continue
 		}
 		entry, declareName, declared, files, perEntryWarnings := volumeEntryFor(volSrc, vm, decision, multiMount[vm.Name], w.name, m)
-		if entry != "" {
+		if entry != nil {
 			svc.Volumes = append(svc.Volumes, entry)
 		}
 		if declared && !declaredVolumes[declareName] {
@@ -702,12 +702,18 @@ func (d shareDecision) shouldPromote(volumeName, mountPath string, inMultiMountC
 }
 
 // multiMountedNames returns the set of volume names this specific
-// container mounts at more than one path — Bitnami's per-path scratch
-// pattern. shouldPromote uses this to suppress the by-name fallback
-// for those mounts so each path stays independent.
+// container mounts at more than one path WITHOUT subPath — the
+// Bitnami per-path scratch pattern that broke when promoted (all
+// six paths ended up showing the same data). Mounts that DO use
+// subPath are excluded from this count: subPath partitions the
+// volume into per-path subdirectories, so promoting is safe and
+// in fact required (init+main share via subpath).
 func multiMountedNames(c kube.Container) map[string]bool {
 	count := map[string]int{}
 	for _, vm := range c.VolumeMounts {
+		if vm.SubPath != "" {
+			continue
+		}
 		count[vm.Name]++
 	}
 	out := map[string]bool{}
@@ -747,15 +753,42 @@ func findVolume(vols []kube.Volume, name string) *kube.Volume {
 //
 // decision carries the pod-level share analysis; inMultiMount says
 // whether THIS specific container mounts this volume name at >1 path
-// (Bitnami's per-path scratch pattern). Together they decide whether
-// an emptyDir gets promoted to a named compose volume (so multiple
-// containers see the same data) or stays anonymous (so each path is
-// independent scratch).
-func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, decision shareDecision, inMultiMount bool, workloadName string, m *kube.Manifests) (string, string, bool, map[string]string, []string) {
+// without distinguishing subPaths (the Bitnami per-path scratch
+// pattern). Together they decide whether an emptyDir gets promoted
+// to a named compose volume (so multiple containers see the same
+// data) or stays anonymous (so each path is independent scratch).
+//
+// Returns `any` so the entry can be either compose's short string
+// form ("name:/path") or a long-form *compose.MountLong struct;
+// the latter is the only way to encode subpath, which Bitnami helm
+// charts use to carve one emptyDir into per-path subdirectories.
+func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, decision shareDecision, inMultiMount bool, workloadName string, m *kube.Manifests) (any, string, bool, map[string]string, []string) {
 	switch {
 	case v.PVC != nil:
+		if vm.SubPath != "" {
+			return &compose.MountLong{
+				Type:   "volume",
+				Source: v.PVC.ClaimName,
+				Target: vm.MountPath,
+				Volume: &compose.MountVolumeOpts{Subpath: vm.SubPath},
+			}, v.PVC.ClaimName, true, nil, nil
+		}
 		return fmt.Sprintf("%s:%s", v.PVC.ClaimName, vm.MountPath), v.PVC.ClaimName, true, nil, nil
 	case v.EmptyDir != nil:
+		// With subPath the volume is partitioned per-path inside the
+		// container; promote unconditionally so init+main can share
+		// via different subPaths in the same backing volume (this is
+		// the Bitnami chart pattern: init copies into <vol>/plugins,
+		// main reads from <vol>/plugins via subPath).
+		if vm.SubPath != "" {
+			named := workloadName + "-" + v.Name
+			return &compose.MountLong{
+				Type:   "volume",
+				Source: named,
+				Target: vm.MountPath,
+				Volume: &compose.MountVolumeOpts{Subpath: vm.SubPath},
+			}, named, true, nil, nil
+		}
 		if decision.shouldPromote(v.Name, vm.MountPath, inMultiMount) {
 			named := workloadName + "-" + v.Name
 			return fmt.Sprintf("%s:%s", named, vm.MountPath), named, true, nil, nil
@@ -768,16 +801,29 @@ func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, decision shareDecision,
 		}
 		return fmt.Sprintf("%s:%s", src, vm.MountPath), "", false, nil, nil
 	case v.ConfigMap != nil:
-		return materializeConfigMap(v.ConfigMap.Name, vm, m)
+		entry, decl, declared, files, warns := materializeConfigMap(v.ConfigMap.Name, vm, m)
+		return mountStringOrNil(entry), decl, declared, files, warns
 	case v.Secret != nil:
-		return materializeSecret(v.Secret.SecretName, vm, m)
+		entry, decl, declared, files, warns := materializeSecret(v.Secret.SecretName, vm, m)
+		return mountStringOrNil(entry), decl, declared, files, warns
 	case v.Projected != nil:
-		return materializeProjected(v, vm, m)
+		entry, decl, declared, files, warns := materializeProjected(v, vm, m)
+		return mountStringOrNil(entry), decl, declared, files, warns
 	}
-	return "", "", false, nil, []string{fmt.Sprintf(
+	return nil, "", false, nil, []string{fmt.Sprintf(
 		"volumeMount %q on %s has an unsupported volume type (only emptyDir, hostPath, configMap, secret, projected, and PVCs are handled); skipping",
 		vm.Name, vm.MountPath,
 	)}
+}
+
+// mountStringOrNil returns nil for empty mount strings (skip) and
+// the string itself otherwise. Lets the materialize* helpers stay
+// string-typed while the public entry point hands back any.
+func mountStringOrNil(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // materializeConfigMap turns a `volumes: { configMap: { name: X } }`

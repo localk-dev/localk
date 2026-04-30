@@ -103,7 +103,7 @@ func buildProxy(
 		Image:   "caddy:2-alpine",
 		Restart: "unless-stopped",
 		Ports:   []string{"80:80"},
-		Volumes: []string{"./Caddyfile:/etc/caddy/Caddyfile:ro"},
+		Volumes: []any{"./Caddyfile:/etc/caddy/Caddyfile:ro"},
 	}
 	return &proxy, caddyfile, backendNames, warnings
 }

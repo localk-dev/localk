@@ -840,14 +840,14 @@ func TestConvert_Sidecar_SharedEmptyDirPromoted(t *testing.T) {
 	sidecarVols := result.Compose.Services["app-logger"].Volumes
 	mainHasShared := false
 	for _, v := range mainVols {
-		if strings.HasPrefix(v, wantNamed) {
+		if strings.HasPrefix(mountStr(v), wantNamed) {
 			mainHasShared = true
 			break
 		}
 	}
 	sideHasShared := false
 	for _, v := range sidecarVols {
-		if strings.HasPrefix(v, wantNamed) {
+		if strings.HasPrefix(mountStr(v), wantNamed) {
 			sideHasShared = true
 			break
 		}
@@ -1113,7 +1113,7 @@ func TestConvert_EmptyDir_MultiMountStaysAnonymous(t *testing.T) {
 		}
 	}
 	for _, v := range got {
-		if strings.Contains(v, "rabbitmq-empty-dir:") {
+		if strings.Contains(mountStr(v), "rabbitmq-empty-dir:") {
 			t.Errorf("no mount should reference the named volume 'rabbitmq-empty-dir', got %q", v)
 		}
 	}
@@ -2057,6 +2057,114 @@ func TestConvert_FQDNAliases_DeploymentNoPodOrdinals(t *testing.T) {
 			t.Errorf("Deployments shouldn't get pod-N aliases, got %q", a)
 		}
 	}
+}
+
+// TestConvert_EmptyDir_SubPathSharesVolume covers Bitnami's rabbitmq
+// chart pattern: one emptyDir mounted by the init container at
+// /emptydir/ AND by the main container at half a dozen paths,
+// each with a different subPath partitioning the volume into
+// per-path subdirectories. Init copies its plugins into
+// /emptydir/app-plugins-dir; main expects to read them at
+// /opt/.../plugins (subPath: app-plugins-dir). Without subpath
+// support compose can't express this share and main starts with
+// an empty plugins dir, hanging Erlang in prelaunch.
+func TestConvert_EmptyDir_SubPathSharesVolume(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "rabbitmq"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "rabbitmq"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "rabbitmq"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{
+							{Name: "empty-dir", EmptyDir: &kube.EmptyDirVol{}},
+						},
+						InitContainers: []kube.Container{{
+							Name:  "prepare-plugins-dir",
+							Image: "bitnami/rabbitmq:3.13",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "empty-dir", MountPath: "/emptydir"},
+							},
+						}},
+						Containers: []kube.Container{{
+							Name:  "rabbitmq",
+							Image: "bitnami/rabbitmq:3.13",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "empty-dir", MountPath: "/tmp", SubPath: "tmp-dir"},
+								{Name: "empty-dir", MountPath: "/opt/bitnami/rabbitmq/plugins", SubPath: "app-plugins-dir"},
+								{Name: "empty-dir", MountPath: "/opt/bitnami/rabbitmq/etc/rabbitmq", SubPath: "app-conf-dir"},
+								{Name: "empty-dir", MountPath: "/opt/bitnami/rabbitmq/var/lib/rabbitmq", SubPath: "app-data-dir"},
+								{Name: "empty-dir", MountPath: "/opt/bitnami/rabbitmq/.rabbitmq", SubPath: "rabbitmq-conf-dir"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if _, ok := result.Compose.Volumes["rabbitmq-empty-dir"]; !ok {
+		t.Errorf("named volume rabbitmq-empty-dir should be declared (init+main share via subpaths); got %v", result.Compose.Volumes)
+	}
+
+	// Init's mount has no subPath — short form is fine.
+	initMounts := result.Compose.Services["rabbitmq-prepare-plugins-dir"].Volumes
+	wantInit := "rabbitmq-empty-dir:/emptydir"
+	found := false
+	for _, m := range initMounts {
+		if mountStr(m) == wantInit {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("init container should mount %q in short form, got %v", wantInit, initMounts)
+	}
+
+	// Each main mount must be long-form referencing the same named
+	// volume + its specific subpath.
+	mainMounts := result.Compose.Services["rabbitmq"].Volumes
+	wantSubpaths := map[string]string{
+		"/tmp":                                    "tmp-dir",
+		"/opt/bitnami/rabbitmq/plugins":           "app-plugins-dir",
+		"/opt/bitnami/rabbitmq/etc/rabbitmq":      "app-conf-dir",
+		"/opt/bitnami/rabbitmq/var/lib/rabbitmq":  "app-data-dir",
+		"/opt/bitnami/rabbitmq/.rabbitmq":         "rabbitmq-conf-dir",
+	}
+	got := map[string]string{}
+	for _, m := range mainMounts {
+		long, ok := m.(*compose.MountLong)
+		if !ok {
+			continue
+		}
+		if long.Source != "rabbitmq-empty-dir" {
+			t.Errorf("expected long-form source rabbitmq-empty-dir, got %q", long.Source)
+		}
+		if long.Volume == nil {
+			t.Errorf("long-form mount should carry a volume.subpath, got %+v", long)
+			continue
+		}
+		got[long.Target] = long.Volume.Subpath
+	}
+	for path, want := range wantSubpaths {
+		if got[path] != want {
+			t.Errorf("mount at %q: subpath = %q, want %q (full got=%v)", path, got[path], want, got)
+		}
+	}
+}
+
+// mountStr returns the short-form string of a Volumes entry, or
+// "" if the entry is a long-form *MountLong (which short-form
+// string assertions don't apply to). Tests that need to inspect
+// long-form entries assert their type explicitly.
+func mountStr(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 func mapKeys(m map[string]string) []string {

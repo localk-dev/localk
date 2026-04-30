@@ -19,7 +19,13 @@ type Service struct {
 	Environment map[string]string `yaml:"environment,omitempty"`
 	EnvFile     []string          `yaml:"env_file,omitempty"`
 	Ports       []string          `yaml:"ports,omitempty"`
-	Volumes     []string          `yaml:"volumes,omitempty"`
+	// Volumes accepts either compose's short-form string ("name:/path"
+	// / ":/path" / "./host:/container:ro") or a long-form MountLong
+	// struct. We need both because compose's short form has no
+	// subpath syntax — for emptyDir/PVC mounts that need to share
+	// one volume across several paths via different subPaths
+	// (Bitnami helm chart pattern), only the long form works.
+	Volumes []any `yaml:"volumes,omitempty"`
 	// DependsOn uses the long form so we can express conditions —
 	// notably `service_completed_successfully` for init-container
 	// dependencies. The map keys are dependency service names.
@@ -95,4 +101,22 @@ type Network struct {
 // inside the compose network).
 type ServiceNetwork struct {
 	Aliases []string `yaml:"aliases,omitempty"`
+}
+
+// MountLong is the long-form volume mount entry. We only emit it
+// when the short string syntax can't represent what we need — at
+// the moment that's only `volume.subpath`, which compose supports
+// only in the long form.
+type MountLong struct {
+	Type     string           `yaml:"type"`
+	Source   string           `yaml:"source"`
+	Target   string           `yaml:"target"`
+	ReadOnly bool             `yaml:"read_only,omitempty"`
+	Volume   *MountVolumeOpts `yaml:"volume,omitempty"`
+}
+
+// MountVolumeOpts carries volume-type-specific options. Right now
+// only subpath, but bind/tmpfs would slot in next to it.
+type MountVolumeOpts struct {
+	Subpath string `yaml:"subpath,omitempty"`
 }

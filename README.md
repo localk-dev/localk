@@ -540,7 +540,8 @@ docker-compose constructs:
 | `ConfigMap`             | `environment` entries (env-source) or files materialized under `configs/<name>/` and bind-mounted (volume-source; honours `subPath` to mount a single key as a file; written 0755 so helm-chart setup scripts can `exec`) |
 | `Secret`                | `.env` entries (env-source) or files materialized under `secrets/<name>/` and bind-mounted (volume-source; honours `subPath` to mount a single key as a file; written 0644 to match k8s default — needed so non-root containers can read them)        |
 | `projected` volume      | every Secret/ConfigMap source flattened into one materialized directory (`secrets/<vol>/` if any source is a Secret, else `configs/<vol>/`); `items` remapping is honoured |
-| `PersistentVolumeClaim` | named `volume`                                      |
+| `PersistentVolumeClaim` | named `volume` (honours `subPath` via compose long-form `volume.subpath`)                                      |
+| `emptyDir` + `subPath`  | named `volume` partitioned by `subpath` — Bitnami helm pattern where init writes to `/empty/foo` and main reads from `/opt/.../foo` (shared backing volume, separate subdirs)  |
 | `Ingress`               | `caddy` reverse proxy + generated `Caddyfile`       |
 
 A `Deployment` named `api` and a `Service` named `api` are merged into one
