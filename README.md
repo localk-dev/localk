@@ -147,6 +147,59 @@ localk down -- --timeout 5
 regenerate the compose file — that's always `localk generate`'s job — so a
 failure points clearly at one side or the other.
 
+## Interactive shell (`localk tui`)
+
+For configuring a 60-service stack, typing service names by hand gets old
+fast. `localk tui` opens an interactive Bubble Tea dashboard showing every
+service with its current state, navigable with arrow keys.
+
+```bash
+localk tui --out-dir ./build
+```
+
+```text
+ localk — /work/build                                12 services
+ ───────────────────────────────────────────────────────────────────
+   STATUS       SERVICE                  IMAGE
+ ───────────────────────────────────────────────────────────────────
+ ▶ ✓ up        api                      ghcr.io/example/api:1.0
+   ✗ disabled  log-collector            example/log-collector:1.0
+   ✓ enabled   notification-service     example/notifications:1.0
+   → :3000     orders-service           example/orders:1.0
+   ⊙ stopped   reports-worker           example/reports:1.0
+   ✓ up        postgres                 postgres:16-alpine
+   ...
+ ───────────────────────────────────────────────────────────────────
+ ↑/↓ navigate · d disable · e dev · r restore · s save · / filter · ? help · q quit
+```
+
+**Keys:**
+- `↑`/`↓` (or `j`/`k`) — move cursor; `g`/`G` jump to top/bottom
+- `d` — toggle sticky disable on current service
+- `e` — enter dev mode (prompts for host port)
+- `r` — restore from dev mode
+- `s` — save pending changes to overlays
+- `/` — filter by service name (substring match)
+- `?` — toggle help overlay
+- `q` (or `Ctrl-C`) — quit; warns about unsaved changes
+
+**Status indicators:**
+- `✓ up` — enabled, container running (live from `docker compose ps`)
+- `✓ enabled` — enabled, no container yet (stack not `up`'d)
+- `⊙ stopped` — enabled, container exited
+- `✗ disabled` — sticky-disabled in `docker-compose.disable.yml`
+- `→ :PORT` — in dev mode, proxy forwards to host PORT
+
+The TUI reads and writes the same `docker-compose.dev.yml` and
+`docker-compose.disable.yml` overlays as the typed `localk dev` and
+`localk disable` commands, so you can move between TUI and CLI freely.
+Pending changes are batched until you press `s` — `q` warns and offers to
+save before quitting.
+
+Live status polling runs every 2 seconds in the background; if the docker
+daemon is offline or the stack isn't up yet, the TUI shows a one-line
+warning and keeps working in offline mode.
+
 ## Working on one service (`localk dev`)
 
 The whole point: pull your prod stack down with `localk generate -k`,

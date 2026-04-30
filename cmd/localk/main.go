@@ -31,6 +31,7 @@ Usage:
   localk disable --restore <service>         [--out-dir <dir>]
   localk disable --clear                     [--out-dir <dir>]
   localk disable --list                      [--out-dir <dir>]
+  localk tui                                 [--out-dir <dir>]
   localk version
   localk help
 
@@ -56,6 +57,9 @@ Commands:
               list; --list shows what's disabled.
               'localk up --disable foo,bar' adds transient disables on
               top of the sticky list (one-shot, no file change).
+  tui         Interactive dashboard: scroll the service list, toggle
+              disable / dev mode with single keystrokes, save and exit.
+              Reads/writes the same overlays as 'disable' and 'dev'.
   version     Print version and exit.
   help        Print this help and exit.
 
@@ -90,6 +94,8 @@ func main() {
 		runDev(os.Args[2:])
 	case "disable":
 		runDisable(os.Args[2:])
+	case "tui":
+		runTui(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("localk", version)
 	case "help", "-h", "--help":

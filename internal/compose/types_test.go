@@ -1,6 +1,9 @@
 package compose_test
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -174,6 +177,58 @@ func TestDeploy_ResourceLimitsRoundTrip(t *testing.T) {
 	}
 	if limits.CPUs != "0.5" || limits.Memory != "512Mi" {
 		t.Errorf("Limits = %+v", limits)
+	}
+}
+
+// TestLoadFile_RoundTripsThroughDisk parses a real-shape compose
+// file and verifies the values that the typed commands and the TUI
+// loader both depend on (Service.Image, Service.Ports). LoadFile is
+// the single entrypoint they share, so a regression here breaks
+// both at once.
+func TestLoadFile_RoundTripsThroughDisk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "docker-compose.yml")
+	body := `
+services:
+  api:
+    image: example/api:1.0
+    ports: ["3000:3000"]
+  worker:
+    image: example/worker:1.0
+volumes:
+  data: {}
+`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := compose.LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if len(f.Services) != 2 {
+		t.Errorf("got %d services, want 2", len(f.Services))
+	}
+	api := f.Services["api"]
+	if api.Image != "example/api:1.0" {
+		t.Errorf("api.Image = %q", api.Image)
+	}
+	if len(api.Ports) != 1 || api.Ports[0] != "3000:3000" {
+		t.Errorf("api.Ports = %v", api.Ports)
+	}
+}
+
+// TestLoadFile_MissingReturnsErrNotExist lets callers branch on
+// errors.Is(err, os.ErrNotExist) to surface friendly hints. The
+// typed `localk dev`/`disable` commands and the TUI all rely on
+// this — anything else (parse errors, permission errors) falls
+// through as a different message.
+func TestLoadFile_MissingReturnsErrNotExist(t *testing.T) {
+	_, err := compose.LoadFile(filepath.Join(t.TempDir(), "nope.yml"))
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected wrapped os.ErrNotExist; got %v", err)
 	}
 }
 

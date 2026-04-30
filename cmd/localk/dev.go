@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/goccy/go-yaml"
-
 	"github.com/localk-dev/localk/internal/compose"
 	"github.com/localk-dev/localk/internal/devmode"
 )
@@ -140,27 +138,20 @@ func runDevList(overlayPath string) {
 }
 
 // loadBaseCompose reads the docker-compose.yml that `localk generate`
-// produced. We need its Services map for two things: validating the
-// service name the user typed, and reading per-service Ports for
-// container-port detection + the printed reference table.
+// produced. Thin wrapper around compose.LoadFile that adds the
+// command-specific "run `localk generate` first" hint when the file
+// is missing — keeps the friendly UX without duplicating the parser.
 func loadBaseCompose(outDir string) (*compose.File, error) {
 	path := filepath.Join(outDir, "docker-compose.yml")
-	data, err := os.ReadFile(path)
+	f, err := compose.LoadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			abs, _ := filepath.Abs(path)
 			return nil, fmt.Errorf("dev: compose file not found at %s\n  run `localk generate <input>` first, or pass --out-dir to point at an existing one", abs)
 		}
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, err
 	}
-	var f compose.File
-	if err := yaml.Unmarshal(data, &f); err != nil {
-		return nil, fmt.Errorf("parsing %s: %w", path, err)
-	}
-	if f.Services == nil {
-		f.Services = map[string]compose.Service{}
-	}
-	return &f, nil
+	return f, nil
 }
 
 func serviceNames(f *compose.File) []string {
