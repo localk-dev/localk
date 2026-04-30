@@ -49,26 +49,74 @@ type devSwapRule struct {
 
 // envLookup unifies access to env values that may live on the
 // service's Environment map (literal values + downward-API
-// substitutions) or in the .env file (everything sourced from a
-// k8s Secret via valueFrom: secretKeyRef). Dev-swap rules read
-// through this so they don't miss values just because a Bitnami
-// chart sourced them from a Secret.
+// substitutions), in the .env file (values sourced from a k8s
+// Secret via valueFrom: secretKeyRef), or in a materialized secret
+// file referenced by a Bitnami-style `<NAME>_FILE` env var. Dev-swap
+// rules read through this so they don't miss values just because
+// a chart sourced them indirectly.
 type envLookup struct {
-	literal     map[string]string
+	literal      map[string]string
 	envFileLines *[]string
 	envFileSeen  map[string]bool
+	// configFiles is the materialized configs/+secrets/ map keyed
+	// by relative path. When a chart env points at a file path
+	// like /opt/bitnami/mongodb/secrets/mongodb-root-password
+	// instead of carrying the value, we resolve it by matching
+	// the basename against entries here.
+	configFiles map[string]string
 }
 
 // get returns the env value under name and whether it was found.
 // Searches the literal Environment first (it always wins because
-// downward-API substitutions override env_file in k8s too) and
-// falls back to .env entries for secret-derived values.
+// downward-API substitutions override env_file in k8s too), then
+// .env entries for secret-derived values, and finally the
+// `<NAME>_FILE` indirection (Bitnami's pattern of pointing env
+// vars at a materialized secret file instead of carrying the
+// value directly).
 func (l envLookup) get(name string) (string, bool) {
 	if v, ok := l.literal[name]; ok && v != "" {
 		return v, true
 	}
+	if v := l.findInEnvFile(name); v != "" {
+		return v, true
+	}
+	// _FILE indirection: e.g. MONGODB_ROOT_PASSWORD missing but
+	// MONGODB_ROOT_PASSWORD_FILE = "/opt/bitnami/mongodb/secrets/mongodb-root-password".
+	// The basename of that path is the Secret key; look it up in
+	// the materialized files map.
+	fileEnv := name + "_FILE"
+	path, ok := l.literal[fileEnv]
+	if !ok || path == "" {
+		path = l.findInEnvFile(fileEnv)
+	}
+	if path != "" && l.configFiles != nil {
+		base := basename(path)
+		// Direct path lookup first (covers the case where the chart
+		// env happens to match our materialized layout exactly).
+		if v, ok := l.configFiles[strings.TrimPrefix(path, "/")]; ok {
+			return v, true
+		}
+		// Fallback: match by basename across all materialized
+		// secret files. The container's mount path may not line up
+		// with our out-dir/secrets/<name>/<key> layout, but the
+		// basename is preserved across both.
+		for relPath, content := range l.configFiles {
+			if !strings.HasPrefix(relPath, "secrets/") {
+				continue
+			}
+			if basename(relPath) == base {
+				return content, true
+			}
+		}
+	}
+	return "", false
+}
+
+// findInEnvFile searches the .env lines for a KEY="value" entry
+// and returns the unquoted value. Returns "" when not present.
+func (l envLookup) findInEnvFile(name string) string {
 	if l.envFileLines == nil {
-		return "", false
+		return ""
 	}
 	prefix := name + "="
 	for _, line := range *l.envFileLines {
@@ -76,16 +124,26 @@ func (l envLookup) get(name string) (string, bool) {
 			continue
 		}
 		v := strings.TrimPrefix(line, prefix)
-		// addEnvFileLine wraps values in double quotes; unwrap.
 		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
 			v = v[1 : len(v)-1]
 		}
-		// Reverse the addEnvFileLine `\"` escaping so callers see
-		// the original value (matters for passwords containing ").
 		v = strings.ReplaceAll(v, `\"`, `"`)
-		return v, true
+		return v
 	}
-	return "", false
+	return ""
+}
+
+// basename returns the last path segment of p (the part after the
+// final `/`). Lets us match a container-side file path
+// ("/opt/bitnami/mongodb/secrets/mongodb-root-password") against
+// our host-side materialized file layout
+// ("secrets/mongodb/mongodb-root-password") without needing to
+// reverse-engineer the volume mount table.
+func basename(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // addToEnvFile re-emits a translated key/value into the .env file
@@ -166,6 +224,7 @@ func applyDevSwap(
 	preserveImage bool,
 	envFileLines *[]string,
 	envFileSeen map[string]bool,
+	configFiles map[string]string,
 ) string {
 	if preserveImage {
 		return ""
@@ -180,6 +239,7 @@ func applyDevSwap(
 		literal:      main.Environment,
 		envFileLines: envFileLines,
 		envFileSeen:  envFileSeen,
+		configFiles:  configFiles,
 	}
 	for _, rule := range devSwapRules {
 		if !rule.matchImage(main.Image) {

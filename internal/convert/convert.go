@@ -233,9 +233,10 @@ func convertWorkload(
 	// Auto-swap clustered chart images for vanilla dev equivalents
 	// (Bitnami mongo replica-set → mongo:7, etc.). Runs before the
 	// user's localk.yaml override so explicit `image:` always wins.
-	// Passes envFileLines so the swap can translate auth values
-	// that came from Secrets (which land in .env, not literal env).
-	if msg := applyDevSwap(name, &main, extras, override.PreserveImage, envFileLines, envFileSeen); msg != "" {
+	// Passes envFileLines AND configFiles so the swap can resolve
+	// auth values whether they came from a Secret (env_file) or
+	// a *_FILE env pointing at a materialized secret on disk.
+	if msg := applyDevSwap(name, &main, extras, override.PreserveImage, envFileLines, envFileSeen, res.ConfigFiles); msg != "" {
 		res.Warnings = append(res.Warnings, msg)
 	}
 

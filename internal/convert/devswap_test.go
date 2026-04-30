@@ -40,7 +40,7 @@ func TestApplyDevSwap_BitnamiMongoSwapsToMongo7(t *testing.T) {
 		},
 	}
 
-	msg := applyDevSwap("mongodb-headless", main, extras, false, nil, nil)
+	msg := applyDevSwap("mongodb-headless", main, extras, false, nil, nil, nil)
 	if msg == "" {
 		t.Fatalf("expected dev-swap warning, got empty")
 	}
@@ -117,7 +117,7 @@ func TestApplyDevSwap_BitnamiRabbitSwapsToVanilla(t *testing.T) {
 	}
 	extras := map[string]compose.Service{}
 
-	msg := applyDevSwap("rabbitmq", main, extras, false, nil, nil)
+	msg := applyDevSwap("rabbitmq", main, extras, false, nil, nil, nil)
 	if msg == "" {
 		t.Fatalf("expected dev-swap warning")
 	}
@@ -168,7 +168,7 @@ func TestApplyDevSwap_TranslatesSecretSourcedAuth(t *testing.T) {
 		"MONGODB_ROOT_PASSWORD": true,
 	}
 
-	msg := applyDevSwap("mongodb-headless", main, nil, false, &envFileLines, envFileSeen)
+	msg := applyDevSwap("mongodb-headless", main, nil, false, &envFileLines, envFileSeen, nil)
 	if msg == "" {
 		t.Fatalf("expected dev-swap warning even when password is in env_file")
 	}
@@ -200,6 +200,45 @@ func TestApplyDevSwap_TranslatesSecretSourcedAuth(t *testing.T) {
 	}
 }
 
+// TestApplyDevSwap_ResolvesPasswordFileIndirection covers the
+// real-world Bitnami mongo pattern: the chart sets
+//
+//	MONGODB_ROOT_PASSWORD_FILE: /opt/bitnami/mongodb/secrets/mongodb-root-password
+//
+// instead of MONGODB_ROOT_PASSWORD directly. The actual password
+// lives in a materialized Secret file under <out-dir>/secrets/. We
+// resolve the indirection by matching the basename against
+// ConfigFiles entries — works even when the chart's container path
+// doesn't line up with our host-side secrets/<name>/<key> layout.
+func TestApplyDevSwap_ResolvesPasswordFileIndirection(t *testing.T) {
+	main := &compose.Service{
+		Image: "docker.io/bitnami/mongodb:7.0",
+		Environment: map[string]string{
+			"MONGODB_REPLICA_SET_MODE":   "primary",
+			"MONGODB_ROOT_USER":          "root",
+			"MONGODB_ROOT_PASSWORD_FILE": "/opt/bitnami/mongodb/secrets/mongodb-root-password",
+		},
+		EnvFile: []string{".env"},
+	}
+	configFiles := map[string]string{
+		"secrets/mongodb/mongodb-root-password":   "actualS3cret",
+		"secrets/mongodb/mongodb-replica-set-key": "ignored",
+	}
+	envFileLines := []string{}
+	envFileSeen := map[string]bool{}
+
+	msg := applyDevSwap("mongodb-headless", main, nil, false, &envFileLines, envFileSeen, configFiles)
+	if msg == "" {
+		t.Fatalf("expected dev-swap warning, got empty")
+	}
+	if got := main.Environment["MONGO_INITDB_ROOT_PASSWORD"]; got != "actualS3cret" {
+		t.Errorf("MONGO_INITDB_ROOT_PASSWORD should resolve via _FILE indirection; got %q, want %q", got, "actualS3cret")
+	}
+	if got := main.Environment["MONGO_INITDB_ROOT_USERNAME"]; got != "root" {
+		t.Errorf("MONGO_INITDB_ROOT_USERNAME = %q, want %q", got, "root")
+	}
+}
+
 // TestApplyDevSwap_PreserveImageOptOut verifies the localk.yaml
 // `preserve_image: true` knob actually keeps the chart image intact.
 // Required for users with custom plugin builds, TLS-enabled Bitnami
@@ -211,7 +250,7 @@ func TestApplyDevSwap_PreserveImageOptOut(t *testing.T) {
 			"MONGODB_REPLICA_SET_MODE": "primary",
 		},
 	}
-	msg := applyDevSwap("mongodb", main, nil, true, nil, nil)
+	msg := applyDevSwap("mongodb", main, nil, true, nil, nil, nil)
 	if msg != "" {
 		t.Errorf("preserve_image=true should suppress dev-swap, got warning %q", msg)
 	}
@@ -232,7 +271,7 @@ func TestApplyDevSwap_SkipsNonClusteredBitnami(t *testing.T) {
 			// no REPLICA_SET_* / INITIAL_PRIMARY_HOST → not clustered
 		},
 	}
-	msg := applyDevSwap("mongo", main, nil, false, nil, nil)
+	msg := applyDevSwap("mongo", main, nil, false, nil, nil, nil)
 	if msg != "" {
 		t.Errorf("non-clustered Bitnami image should NOT trigger swap, got %q", msg)
 	}
@@ -250,7 +289,7 @@ func TestApplyDevSwap_LeavesUnknownImages(t *testing.T) {
 			"DATABASE_URL": "postgres://...",
 		},
 	}
-	msg := applyDevSwap("app", main, nil, false, nil, nil)
+	msg := applyDevSwap("app", main, nil, false, nil, nil, nil)
 	if msg != "" {
 		t.Errorf("non-chart image should be ignored, got swap warning %q", msg)
 	}
