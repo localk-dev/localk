@@ -22,7 +22,14 @@ type Result struct {
 	Compose   *compose.File
 	EnvFile   string // contents to write to .env (may be empty)
 	CaddyFile string // contents to write to Caddyfile (empty when no Ingress)
-	Warnings  []string
+	// ConfigFiles maps relative paths (under the out-dir) to file
+	// contents. Populated when k8s ConfigMaps and Secrets are
+	// referenced as volume mounts: each key in the resource becomes
+	// one file on disk, and the service gets a bind-mount entry
+	// pointing at the directory. Compose has no native equivalent
+	// of "mount this configmap data as files," so we materialize.
+	ConfigFiles map[string]string
+	Warnings    []string
 }
 
 // Convert translates the given Manifests bundle into a Result. The optional
@@ -34,6 +41,7 @@ func Convert(m *kube.Manifests, cfg *config.Config) (*Result, error) {
 			Services: map[string]compose.Service{},
 			Volumes:  map[string]compose.Volume{},
 		},
+		ConfigFiles: map[string]string{},
 	}
 
 	// Track which volumes we have declared at the top level so we don't
@@ -189,7 +197,7 @@ func convertWorkload(
 		return nil
 	}
 
-	main, extras, warnings, err := convertPod(w, name, m, declaredVolumes, res.Compose, envFileLines, envFileSeen)
+	main, extras, warnings, err := convertPod(w, name, m, declaredVolumes, res.Compose, envFileLines, envFileSeen, res.ConfigFiles)
 	if err != nil {
 		return err
 	}
@@ -228,6 +236,7 @@ func convertPod(
 	out *compose.File,
 	envFileLines *[]string,
 	envFileSeen map[string]bool,
+	configFiles map[string]string,
 ) (compose.Service, map[string]compose.Service, []string, error) {
 	var warnings []string
 
@@ -255,7 +264,7 @@ func convertPod(
 	// init with condition: service_completed_successfully.
 	var initNames []string
 	for i, c := range w.pod.Spec.InitContainers {
-		s, w2 := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared)
+		s, w2 := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, configFiles)
 		warnings = append(warnings, w2...)
 		s.Restart = "no"
 		name := mainName + "-" + c.Name
@@ -269,7 +278,7 @@ func convertPod(
 	}
 
 	// --- Main container.
-	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, shared)
+	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, configFiles)
 	warnings = append(warnings, mainWarnings...)
 
 	// Service-derived ports are published only by the main's service.
@@ -289,7 +298,7 @@ func convertPod(
 
 	// --- Sidecars (run alongside main, sharing its network namespace).
 	for _, c := range containers[1:] {
-		sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared)
+		sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, configFiles)
 		warnings = append(warnings, scWarnings...)
 		sc.NetworkMode = "service:" + mainName
 		extras[mainName+"-"+c.Name] = sc
@@ -312,6 +321,7 @@ func buildContainerService(
 	envFileLines *[]string,
 	envFileSeen map[string]bool,
 	shared map[string]bool,
+	configFiles map[string]string,
 ) (compose.Service, []string) {
 	var warnings []string
 
@@ -434,7 +444,7 @@ func buildContainerService(
 			))
 			continue
 		}
-		entry, declareName, declared := volumeEntryFor(volSrc, vm, shared, w.name)
+		entry, declareName, declared, files, perEntryWarnings := volumeEntryFor(volSrc, vm, shared, w.name, m)
 		if entry != "" {
 			svc.Volumes = append(svc.Volumes, entry)
 		}
@@ -442,6 +452,13 @@ func buildContainerService(
 			out.Volumes[declareName] = compose.Volume{}
 			declaredVolumes[declareName] = true
 		}
+		// Merge any materialized ConfigMap/Secret files into the
+		// shared map. Same CM mounted in multiple containers is a
+		// no-op write; each key produces the same content.
+		for path, content := range files {
+			configFiles[path] = content
+		}
+		warnings = append(warnings, perEntryWarnings...)
 	}
 
 	// --- Resource limits ---
@@ -492,36 +509,96 @@ func findVolume(vols []kube.Volume, name string) *kube.Volume {
 	return nil
 }
 
-// volumeEntryFor returns (mount string, declared volume name, was a top-level
-// volume declared) for a given k8s volume reference.
+// volumeEntryFor returns the compose-side volume mount info for a
+// given k8s volume reference, plus any files that need to be
+// materialized on disk (for ConfigMap/Secret-backed volumes which
+// have no native compose equivalent — we write the data to files
+// under the out-dir and bind-mount the directory).
 //
-// shared lists volume names referenced by 2+ containers in the same pod.
-// When an emptyDir falls into that set we promote it to a named compose
-// volume (prefixed with the workload name to avoid collisions) so every
-// container sharing it sees the same data — without promotion, each
-// compose service would get its own anonymous tmpfs and the sharing
-// silently breaks.
-func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, shared map[string]bool, workloadName string) (string, string, bool) {
+// Returns:
+//   - mount: the entry to append to the service's `volumes:` list
+//     (empty string = no mount, e.g. for unsupported types)
+//   - declareName: name of a top-level volume to declare (PVCs and
+//     promoted shared emptyDirs); empty when no top-level decl
+//   - declared: whether the caller should add declareName to volumes
+//   - files: relative-path → content to write before `up` (under the
+//     out-dir's `configs/` or `secrets/` tree)
+//   - warnings: things the user should know (missing CM/Secret refs,
+//     mostly)
+//
+// shared lists volume names referenced by 2+ containers in the same
+// pod. When an emptyDir falls into that set we promote it to a named
+// compose volume (prefixed with the workload name to avoid collisions)
+// so every container sharing it sees the same data.
+func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, shared map[string]bool, workloadName string, m *kube.Manifests) (string, string, bool, map[string]string, []string) {
 	switch {
 	case v.PVC != nil:
-		// Named volume that needs a top-level declaration.
-		return fmt.Sprintf("%s:%s", v.PVC.ClaimName, vm.MountPath), v.PVC.ClaimName, true
+		return fmt.Sprintf("%s:%s", v.PVC.ClaimName, vm.MountPath), v.PVC.ClaimName, true, nil, nil
 	case v.EmptyDir != nil:
 		if shared[v.Name] {
 			named := workloadName + "-" + v.Name
-			return fmt.Sprintf("%s:%s", named, vm.MountPath), named, true
+			return fmt.Sprintf("%s:%s", named, vm.MountPath), named, true, nil, nil
 		}
-		// Anonymous tmpfs-style volume; compose handles this fine without declaration.
-		return vm.MountPath, "", false
+		return vm.MountPath, "", false, nil, nil
 	case v.HostPath != nil:
-		return fmt.Sprintf("%s:%s", v.HostPath.Path, vm.MountPath), "", false
-	case v.ConfigMap != nil, v.Secret != nil:
-		// ConfigMap/Secret-backed volumes would require materializing files
-		// into a host directory. Skip for v0.1 and let the user wire env vars
-		// instead.
-		return "", "", false
+		return fmt.Sprintf("%s:%s", v.HostPath.Path, vm.MountPath), "", false, nil, nil
+	case v.ConfigMap != nil:
+		return materializeConfigMap(v.ConfigMap.Name, vm, m)
+	case v.Secret != nil:
+		return materializeSecret(v.Secret.SecretName, vm, m)
 	}
-	return "", "", false
+	return "", "", false, nil, nil
+}
+
+// materializeConfigMap turns a `volumes: { configMap: { name: X } }`
+// reference into:
+//   - a bind-mount entry pointing at out-dir/configs/X
+//   - one file per key in the ConfigMap's data
+//
+// The mount is read-only because k8s defaults configMap volumes to
+// read-only — apps that try to write back would silently succeed
+// locally and fail in prod, which is a worse failure mode than just
+// rejecting writes everywhere.
+func materializeConfigMap(name string, vm kube.VolumeMount, m *kube.Manifests) (string, string, bool, map[string]string, []string) {
+	cm := m.FindConfigMap(name)
+	if cm == nil {
+		return "", "", false, nil, []string{fmt.Sprintf(
+			"volumeMount %q references ConfigMap %q which is not defined; skipping the mount (the container will see an empty directory at %s)",
+			vm.Name, name, vm.MountPath,
+		)}
+	}
+	files := map[string]string{}
+	for key, val := range cm.Data {
+		files[fmt.Sprintf("configs/%s/%s", name, key)] = val
+	}
+	mount := fmt.Sprintf("./configs/%s:%s:ro", name, vm.MountPath)
+	return mount, "", false, files, nil
+}
+
+// materializeSecret is the Secret-volume sibling of materializeConfigMap.
+// Decodes base64 data + merges stringData (matching k8s semantics)
+// before writing files. A warning surfaces because the resulting
+// files contain real secret values — same hazard the .env file
+// already has, restated for the volume case so users don't miss it.
+func materializeSecret(name string, vm kube.VolumeMount, m *kube.Manifests) (string, string, bool, map[string]string, []string) {
+	sec := m.FindSecret(name)
+	if sec == nil {
+		return "", "", false, nil, []string{fmt.Sprintf(
+			"volumeMount %q references Secret %q which is not defined; skipping the mount",
+			vm.Name, name,
+		)}
+	}
+	values := secretValues(sec) // existing helper: merges Data (b64) and StringData
+	files := map[string]string{}
+	for key, val := range values {
+		files[fmt.Sprintf("secrets/%s/%s", name, key)] = val
+	}
+	mount := fmt.Sprintf("./secrets/%s:%s:ro", name, vm.MountPath)
+	warning := fmt.Sprintf(
+		"Secret %q materialized as files under secrets/%s/. These are real cluster secret values — add `secrets/` to .gitignore and never commit them.",
+		name, name,
+	)
+	return mount, "", false, files, []string{warning}
 }
 
 // containerPortFromService picks the right container-side port for a Service

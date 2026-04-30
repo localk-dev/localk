@@ -248,6 +248,21 @@ func runGenerate(args []string) {
 		}
 	}
 
+	// ConfigMap- and Secret-backed volume mounts: write each entry's
+	// data to a file under <out-dir>/configs/<name>/ (or secrets/).
+	// Compose then bind-mounts the whole directory into the
+	// container, giving the app the same per-key filenames it'd see
+	// in k8s.
+	for relPath, content := range result.ConfigFiles {
+		fullPath := filepath.Join(*outDir, relPath)
+		if err := ensureParentDir(fullPath); err != nil {
+			fail("preparing directory for %s: %v", fullPath, err)
+		}
+		if err := writeFile(fullPath, []byte(content)); err != nil {
+			fail("writing %s: %v", fullPath, err)
+		}
+	}
+
 	abs, _ := filepath.Abs(composePath)
 	fmt.Printf("Wrote %s (%d services)\n", abs, len(result.Compose.Services))
 	if envContents != "" {
@@ -257,6 +272,10 @@ func runGenerate(args []string) {
 	if result.CaddyFile != "" {
 		caddyAbs, _ := filepath.Abs(caddyPath)
 		fmt.Printf("Wrote %s for the Caddy reverse proxy.\n", caddyAbs)
+	}
+	if len(result.ConfigFiles) > 0 {
+		fmt.Printf("Wrote %d config/secret file(s) under %s/{configs,secrets}/.\n",
+			len(result.ConfigFiles), *outDir)
 	}
 
 	for _, w := range result.Warnings {

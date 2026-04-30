@@ -1182,6 +1182,204 @@ func TestConvert_MemoryUnits(t *testing.T) {
 	}
 }
 
+// TestConvert_ConfigMapVolumeMount covers the realistic case
+// surfaced by mp-production: a service like NATS that needs its
+// config mounted at a known path. Compose has no native equivalent,
+// so we materialize each ConfigMap key into a file under
+// configs/<name>/ and bind-mount the directory into the container
+// read-only (matching k8s configMap-volume semantics).
+func TestConvert_ConfigMapVolumeMount(t *testing.T) {
+	manifests := &kube.Manifests{
+		ConfigMaps: []kube.ConfigMap{{
+			Metadata: kube.ObjectMeta{Name: "nats-config"},
+			Data: map[string]string{
+				"nats.conf":    "port: 4222\n",
+				"cluster.conf": "cluster: { listen: 0.0.0.0:6222 }\n",
+			},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "nats"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "nats"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "nats"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{{
+							Name:      "cfg",
+							ConfigMap: &kube.ConfigMapVol{Name: "nats-config"},
+						}},
+						Containers: []kube.Container{{
+							Name:    "nats",
+							Image:   "nats:alpine",
+							Command: []string{"--config", "/etc/nats-config/nats.conf"},
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "cfg", MountPath: "/etc/nats-config"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	// Mount entry: bind-mounted, read-only, under configs/<name>/.
+	nats := result.Compose.Services["nats"]
+	wantMount := "./configs/nats-config:/etc/nats-config:ro"
+	found := false
+	for _, v := range nats.Volumes {
+		if v == wantMount {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected mount %q in nats.Volumes; got %v", wantMount, nats.Volumes)
+	}
+
+	// Each key in the ConfigMap should be a separate file in the
+	// result's ConfigFiles map.
+	for _, key := range []string{"nats.conf", "cluster.conf"} {
+		path := "configs/nats-config/" + key
+		if _, present := result.ConfigFiles[path]; !present {
+			t.Errorf("expected ConfigFiles[%q] to be populated; got keys: %v", path, mapKeys(result.ConfigFiles))
+		}
+	}
+	// Spot-check content survived round-trip.
+	if got := result.ConfigFiles["configs/nats-config/nats.conf"]; got != "port: 4222\n" {
+		t.Errorf("nats.conf content mismatch; got %q", got)
+	}
+}
+
+// TestConvert_SecretVolumeMount verifies the Secret-volume sibling.
+// Secret values get base64-decoded (existing secretValues helper),
+// written under secrets/<name>/, mounted read-only. A warning fires
+// because the resulting files contain real secret values — same
+// hazard as the .env file, restated for the volume case.
+func TestConvert_SecretVolumeMount(t *testing.T) {
+	manifests := &kube.Manifests{
+		Secrets: []kube.Secret{{
+			Metadata:   kube.ObjectMeta{Name: "tls"},
+			StringData: map[string]string{"cert.pem": "PEMDATA", "key.pem": "PRIVATEKEY"},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "web"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "web"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "web"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{{
+							Name:   "tls",
+							Secret: &kube.SecretVol{SecretName: "tls"},
+						}},
+						Containers: []kube.Container{{
+							Name:  "web",
+							Image: "nginx",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "tls", MountPath: "/etc/tls"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	wantMount := "./secrets/tls:/etc/tls:ro"
+	web := result.Compose.Services["web"]
+	found := false
+	for _, v := range web.Volumes {
+		if v == wantMount {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected mount %q in web.Volumes; got %v", wantMount, web.Volumes)
+	}
+
+	if got := result.ConfigFiles["secrets/tls/cert.pem"]; got != "PEMDATA" {
+		t.Errorf("cert.pem content mismatch; got %q", got)
+	}
+	if got := result.ConfigFiles["secrets/tls/key.pem"]; got != "PRIVATEKEY" {
+		t.Errorf("key.pem content mismatch; got %q", got)
+	}
+
+	// A warning should explicitly flag that files contain real
+	// secret values — same hazard the .env file already calls out.
+	found = false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "secrets/") && strings.Contains(w, ".gitignore") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a warning naming secrets/ and gitignore; got %v", result.Warnings)
+	}
+}
+
+// TestConvert_ConfigMapVolumeMissingWarns surfaces the case where
+// a volumeMount references a ConfigMap that isn't in the input.
+// Unlike a missing PVC, we can't fall back to anything sensible —
+// just warn and skip the mount.
+func TestConvert_ConfigMapVolumeMissingWarns(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{{
+							Name:      "cfg",
+							ConfigMap: &kube.ConfigMapVol{Name: "missing-cm"},
+						}},
+						Containers: []kube.Container{{
+							Name:         "app",
+							Image:        "alpine",
+							VolumeMounts: []kube.VolumeMount{{Name: "cfg", MountPath: "/etc/cfg"}},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	app := result.Compose.Services["app"]
+	if len(app.Volumes) != 0 {
+		t.Errorf("missing CM should result in no mount; got %v", app.Volumes)
+	}
+	found := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, "missing-cm") && strings.Contains(w, "not defined") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning naming the missing ConfigMap; got %v", result.Warnings)
+	}
+}
+
+func mapKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // TestConvert_StatefulSetSkipOverride verifies localk.yaml overrides apply
 // to StatefulSets the same way they do to Deployments.
 func TestConvert_StatefulSetSkipOverride(t *testing.T) {
