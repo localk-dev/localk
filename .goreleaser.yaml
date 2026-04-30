@@ -55,9 +55,24 @@ changelog:
       - "Merge pull request"
       - "Merge branch"
 
-# Homebrew tap. Uncomment after creating the localk-dev/homebrew-tap repo and
-# providing a GH_PAT secret with `repo` scope. Until then leave commented so
-# releases don't fail.
+# Homebrew tap. Activation is two steps — keep this block commented
+# until BOTH are done, otherwise the release workflow will fail and
+# leave a half-published tag behind.
+#
+#   1. Create the tap repo on GitHub: https://github.com/new
+#        owner: localk-dev
+#        name:  homebrew-tap
+#        public, no README needed (goreleaser fills it in)
+#
+#   2. Provision a personal access token with `repo` scope (fine-grained
+#      tokens scoped to just the tap repo also work) and add it as a
+#      repository secret on the LOCALK repo (not the tap repo):
+#        Settings → Secrets and variables → Actions → New repository secret
+#        Name:  HOMEBREW_TAP_TOKEN
+#        Value: <the PAT>
+#
+# Once both are in place, uncomment the block and tag the next release.
+# `brew install localk-dev/tap/localk` will then work for end users.
 #
 # brews:
 #   - repository:
