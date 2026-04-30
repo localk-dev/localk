@@ -22,11 +22,15 @@ const usage = `localk - run your Kubernetes stack locally with one command.
 Usage:
   localk generate <input-dir> [--out-dir <dir>] [-o <file>] [--config <file>] [--dry-run]
   localk generate -k [-n <namespace>] [--context <name>] [-y] [--out-dir <dir>] [--config <file>] [--dry-run]
-  localk up   [--out-dir <dir>] [-f <file>] [--build] [--no-detach] [-- DOCKER_COMPOSE_ARGS...]
+  localk up   [--out-dir <dir>] [-f <file>] [--build] [--no-detach] [--disable <list>] [-- DOCKER_COMPOSE_ARGS...]
   localk down [--out-dir <dir>] [-f <file>] [-v] [-- DOCKER_COMPOSE_ARGS...]
   localk dev  <service> --port <host-port> [--out-dir <dir>] [--container-port <n>]
   localk dev  --stop <service> [--out-dir <dir>]
   localk dev  --list [--out-dir <dir>]
+  localk disable <service> [<service> ...]   [--out-dir <dir>]
+  localk disable --restore <service>         [--out-dir <dir>]
+  localk disable --clear                     [--out-dir <dir>]
+  localk disable --list                      [--out-dir <dir>]
   localk version
   localk help
 
@@ -46,6 +50,12 @@ Commands:
               so you can run that service in your IDE while the rest of
               the stack keeps running. --stop restores. --list shows what's
               currently in dev mode.
+  disable     Stop named services from starting on 'localk up'. Sticky:
+              persists across runs in docker-compose.disable.yml.
+              --restore <service> brings one back; --clear empties the
+              list; --list shows what's disabled.
+              'localk up --disable foo,bar' adds transient disables on
+              top of the sticky list (one-shot, no file change).
   version     Print version and exit.
   help        Print this help and exit.
 
@@ -78,6 +88,8 @@ func main() {
 		runDown(os.Args[2:])
 	case "dev":
 		runDev(os.Args[2:])
+	case "disable":
+		runDisable(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("localk", version)
 	case "help", "-h", "--help":
@@ -431,6 +443,10 @@ func reorderFlagsFirst(args []string) []string {
 		"--container-port": true,
 		"-stop":            true,
 		"--stop":           true,
+		"-restore":         true,
+		"--restore":        true,
+		"-disable":         true,
+		"--disable":        true,
 	}
 	knownBoolFlags := map[string]bool{
 		"-k":             true,
@@ -440,6 +456,8 @@ func reorderFlagsFirst(args []string) []string {
 		"--dry-run":      true,
 		"-list":          true,
 		"--list":         true,
+		"-clear":         true,
+		"--clear":        true,
 	}
 
 	var flagsArgs, positional []string

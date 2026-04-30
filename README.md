@@ -216,6 +216,51 @@ services that sit behind an Ingress).
 > reach the host. macOS and Windows already have `host.docker.internal`
 > mapped automatically; the entry is harmless on every platform.
 
+## Skipping services (`localk disable`)
+
+Big stacks rarely need every service running locally. You probably
+don't want to spin up the full observability pipeline, or services
+that depend on cloud-only secrets. `localk disable` keeps the named
+services from starting on `localk up`, without modifying the base
+compose file.
+
+```bash
+# Stop these from starting on the next `localk up`. Sticky — persists.
+localk disable seq influxdb-influxdb2 rabbitmq
+
+# Show what's currently disabled
+localk disable --list
+
+# Bring one back
+localk disable --restore rabbitmq
+
+# Wipe the disable list
+localk disable --clear
+```
+
+Sticky entries live in a `docker-compose.disable.yml` overlay next to
+your compose file. Each entry uses compose's
+`profiles: ["disabled"]` mechanism — services with profiles only
+start when that profile is activated, and we never activate this
+one. `localk up` and `localk down` auto-detect the overlay (same as
+the dev overlay) so no extra flags needed.
+
+For one-off skips that shouldn't persist, use `--disable` directly on
+`up`:
+
+```bash
+# Disable just for this run; doesn't touch the sticky list.
+localk up --disable postgres,redis
+```
+
+The transient `--disable` is additive — sticky entries from the
+overlay still apply alongside it.
+
+A service in dev mode (`localk dev <service>`) cannot be disabled —
+the proxy is what's keeping the network DNS working for the rest of
+the stack. Run `localk dev --stop <service>` first if you need it
+disabled.
+
 ## Previewing the output (`--dry-run`)
 
 Add `--dry-run` to any `generate` invocation to print exactly what would be

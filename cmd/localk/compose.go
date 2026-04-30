@@ -18,8 +18,10 @@ func runUp(args []string) {
 	composeFile := fs.String("f", "docker-compose.yml", "compose file path; relative paths are resolved against --out-dir")
 	build := fs.Bool("build", false, "rebuild images before starting (passes --build to docker compose)")
 	noDetach := fs.Bool("no-detach", false, "keep the foreground attached (default: detach so the terminal returns)")
+	disable := fs.String("disable", "", "comma-separated list of services to skip for this run (additive to the sticky `localk disable` list)")
 
 	args, passthrough := splitDoubleDash(args)
+	args = reorderFlagsFirst(args)
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -34,12 +36,19 @@ func runUp(args []string) {
 
 	dcArgs := []string{"compose", "-f", path}
 	dcArgs = appendDevOverlayIfPresent(dcArgs, *outDir)
+	dcArgs = appendDisableOverlayIfPresent(dcArgs, *outDir)
 	dcArgs = append(dcArgs, "up")
 	if !*noDetach {
 		dcArgs = append(dcArgs, "-d")
 	}
 	if *build {
 		dcArgs = append(dcArgs, "--build")
+	}
+	// Transient disables: --scale <name>=0 keeps the service definition
+	// in compose but starts zero replicas. Stacks with the sticky
+	// overlay (which uses profiles) — both apply.
+	for _, s := range splitCommaList(*disable) {
+		dcArgs = append(dcArgs, "--scale", s+"=0")
 	}
 	dcArgs = append(dcArgs, passthrough...)
 
@@ -72,6 +81,7 @@ func runDown(args []string) {
 
 	dcArgs := []string{"compose", "-f", path}
 	dcArgs = appendDevOverlayIfPresent(dcArgs, *outDir)
+	dcArgs = appendDisableOverlayIfPresent(dcArgs, *outDir)
 	dcArgs = append(dcArgs, "down")
 	if *volumes {
 		dcArgs = append(dcArgs, "-v")
@@ -92,6 +102,46 @@ func appendDevOverlayIfPresent(dcArgs []string, outDir string) []string {
 		dcArgs = append(dcArgs, "-f", overlay)
 	}
 	return dcArgs
+}
+
+// appendDisableOverlayIfPresent does the same thing for the disable
+// overlay (sticky list of services that should not start). Stacks
+// cleanly with the dev overlay — compose merges as many `-f` files as
+// you point at it.
+func appendDisableOverlayIfPresent(dcArgs []string, outDir string) []string {
+	overlay := filepath.Join(outDir, disableFilename)
+	if _, err := os.Stat(overlay); err == nil {
+		dcArgs = append(dcArgs, "-f", overlay)
+	}
+	return dcArgs
+}
+
+// splitCommaList splits a comma-separated flag value, trimming spaces
+// and dropping empty entries. Used for `localk up --disable foo,bar`
+// where users naturally write the list with spaces around the commas.
+func splitCommaList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == ',' {
+			seg := s[start:i]
+			start = i + 1
+			// trim spaces
+			for len(seg) > 0 && (seg[0] == ' ' || seg[0] == '\t') {
+				seg = seg[1:]
+			}
+			for len(seg) > 0 && (seg[len(seg)-1] == ' ' || seg[len(seg)-1] == '\t') {
+				seg = seg[:len(seg)-1]
+			}
+			if seg != "" {
+				out = append(out, seg)
+			}
+		}
+	}
+	return out
 }
 
 // resolveExistingCompose resolves a compose file path the same way

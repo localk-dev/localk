@@ -91,6 +91,29 @@ func TestResolveExistingCompose(t *testing.T) {
 	})
 }
 
+func TestSplitCommaList(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"single", "foo", []string{"foo"}},
+		{"two", "foo,bar", []string{"foo", "bar"}},
+		{"trims spaces", "foo, bar , baz", []string{"foo", "bar", "baz"}},
+		{"drops empty segments from trailing/leading commas", ",foo,,bar,", []string{"foo", "bar"}},
+		{"all-spaces segment dropped", "foo,   ,bar", []string{"foo", "bar"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := splitCommaList(tc.in)
+			if !equalStrings(got, tc.want) {
+				t.Errorf("splitCommaList(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) == 0 && len(b) == 0 {
 		return true
