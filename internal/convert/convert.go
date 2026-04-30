@@ -720,8 +720,13 @@ func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, decision shareDecision,
 		return materializeConfigMap(v.ConfigMap.Name, vm, m)
 	case v.Secret != nil:
 		return materializeSecret(v.Secret.SecretName, vm, m)
+	case v.Projected != nil:
+		return materializeProjected(v, vm, m)
 	}
-	return "", "", false, nil, nil
+	return "", "", false, nil, []string{fmt.Sprintf(
+		"volumeMount %q on %s has an unsupported volume type (only emptyDir, hostPath, configMap, secret, projected, and PVCs are handled); skipping",
+		vm.Name, vm.MountPath,
+	)}
 }
 
 // materializeConfigMap turns a `volumes: { configMap: { name: X } }`
@@ -801,6 +806,102 @@ func materializeSecret(name string, vm kube.VolumeMount, m *kube.Manifests) (str
 	}
 	mount := fmt.Sprintf("./secrets/%s:%s:ro", name, vm.MountPath)
 	return mount, "", false, files, []string{warning}
+}
+
+// materializeProjected turns a `volumes: { projected: { sources: [...] } }`
+// reference into a single bind-mount entry plus a flat set of
+// materialized files combining every source into one directory.
+//
+// k8s projected volumes are how Bitnami helm charts (and many
+// others) deliver multi-file secrets — rabbitmq's chart projects
+// rabbitmq-password and rabbitmq-erlang-cookie into the same
+// /opt/bitnami/rabbitmq/secrets directory, then the entrypoint
+// reads each file by name. Without projected support, localk
+// would silently drop the mount, the container would find no
+// secrets, and rabbit would hang forever before opening AMQP.
+//
+// The output dir lands under `secrets/<vol>/` if any source is a
+// Secret (so the file mode logic in cmd/localk picks 0644 — needed
+// for non-root containers to read), or `configs/<vol>/` otherwise.
+// Keys are flattened across all sources; on conflict, later sources
+// win, matching k8s behavior.
+func materializeProjected(v *kube.Volume, vm kube.VolumeMount, m *kube.Manifests) (string, string, bool, map[string]string, []string) {
+	var warnings []string
+	files := map[string]string{}
+	hasSecret := false
+	allKeys := map[string]string{}
+
+	for _, src := range v.Projected.Sources {
+		switch {
+		case src.Secret != nil:
+			hasSecret = true
+			sec := m.FindSecret(src.Secret.Name)
+			if sec == nil {
+				warnings = append(warnings, fmt.Sprintf(
+					"projected volume %q references Secret %q which is not defined; skipping that source",
+					v.Name, src.Secret.Name,
+				))
+				continue
+			}
+			values := secretValues(sec)
+			collect(allKeys, values, src.Secret.Items)
+		case src.ConfigMap != nil:
+			cm := m.FindConfigMap(src.ConfigMap.Name)
+			if cm == nil {
+				warnings = append(warnings, fmt.Sprintf(
+					"projected volume %q references ConfigMap %q which is not defined; skipping that source",
+					v.Name, src.ConfigMap.Name,
+				))
+				continue
+			}
+			collect(allKeys, cm.Data, src.ConfigMap.Items)
+		}
+	}
+
+	prefix := "configs"
+	if hasSecret {
+		prefix = "secrets"
+		warnings = append(warnings, fmt.Sprintf(
+			"projected volume %q materialized as files under %s/%s/. These include real cluster secret values — add `secrets/` to .gitignore.",
+			v.Name, prefix, v.Name,
+		))
+	}
+	for key, val := range allKeys {
+		files[fmt.Sprintf("%s/%s/%s", prefix, v.Name, key)] = val
+	}
+
+	// subPath on a projected volume mounts a single key as a file
+	// (just like ConfigMap/Secret subPath). Match that behavior.
+	if vm.SubPath != "" {
+		if _, ok := allKeys[vm.SubPath]; !ok {
+			return "", "", false, files, append(warnings, fmt.Sprintf(
+				"volumeMount %q on projected volume %q has subPath %q but that key is not present in any source",
+				vm.Name, v.Name, vm.SubPath,
+			))
+		}
+		mount := fmt.Sprintf("./%s/%s/%s:%s:ro", prefix, v.Name, vm.SubPath, vm.MountPath)
+		return mount, "", false, files, warnings
+	}
+	mount := fmt.Sprintf("./%s/%s:%s:ro", prefix, v.Name, vm.MountPath)
+	return mount, "", false, files, warnings
+}
+
+// collect flattens a source's data into the accumulated key map,
+// applying items remapping when present (k8s lets a projected
+// source select specific keys and rename their on-disk path). With
+// no items, every key is projected under its own name.
+func collect(dst, src map[string]string, items []kube.KeyToPath) {
+	if len(items) == 0 {
+		for k, v := range src {
+			dst[k] = v
+		}
+		return
+	}
+	for _, it := range items {
+		if v, ok := src[it.Key]; ok {
+			dst[it.Path] = v
+		}
+	}
 }
 
 // containerPortFromService picks the right container-side port for a Service

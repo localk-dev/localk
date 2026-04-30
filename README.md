@@ -518,6 +518,7 @@ docker-compose constructs:
 | `Service`               | service hostname + port mapping                     |
 | `ConfigMap`             | `environment` entries (env-source) or files materialized under `configs/<name>/` and bind-mounted (volume-source; honours `subPath` to mount a single key as a file; written 0755 so helm-chart setup scripts can `exec`) |
 | `Secret`                | `.env` entries (env-source) or files materialized under `secrets/<name>/` and bind-mounted (volume-source; honours `subPath` to mount a single key as a file; written 0644 to match k8s default — needed so non-root containers can read them)        |
+| `projected` volume      | every Secret/ConfigMap source flattened into one materialized directory (`secrets/<vol>/` if any source is a Secret, else `configs/<vol>/`); `items` remapping is honoured |
 | `PersistentVolumeClaim` | named `volume`                                      |
 | `Ingress`               | `caddy` reverse proxy + generated `Caddyfile`       |
 

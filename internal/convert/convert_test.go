@@ -1697,6 +1697,190 @@ func TestConvert_SecretVolumeMount_SubPath(t *testing.T) {
 	}
 }
 
+// TestConvert_ProjectedVolume_SecretSource covers the Bitnami
+// rabbit pattern: a projected volume combines secret keys
+// (rabbitmq-password, rabbitmq-erlang-cookie) into one directory
+// the entrypoint reads from. Without projected support the mount
+// silently disappears, the container finds no secrets, and rabbit
+// hangs before opening AMQP — taking down every downstream client.
+func TestConvert_ProjectedVolume_SecretSource(t *testing.T) {
+	manifests := &kube.Manifests{
+		Secrets: []kube.Secret{{
+			Metadata: kube.ObjectMeta{Name: "rabbitmq"},
+			StringData: map[string]string{
+				"rabbitmq-password":       "supersecret",
+				"rabbitmq-erlang-cookie":  "ABCDEF",
+				"rabbitmq-admin-password": "anotherone",
+			},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "rabbitmq"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "rabbitmq"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "rabbitmq"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{
+							{
+								Name: "rabbit-secrets",
+								Projected: &kube.ProjectedVol{
+									Sources: []kube.ProjectedSource{
+										{Secret: &kube.ProjectedSecretSource{Name: "rabbitmq"}},
+									},
+								},
+							},
+						},
+						Containers: []kube.Container{{
+							Name:  "rabbitmq",
+							Image: "bitnami/rabbitmq:3.13",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "rabbit-secrets", MountPath: "/opt/bitnami/rabbitmq/secrets"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	mounts := result.Compose.Services["rabbitmq"].Volumes
+	want := "./secrets/rabbit-secrets:/opt/bitnami/rabbitmq/secrets:ro"
+	found := false
+	for _, m := range mounts {
+		if m == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected projected mount %q in service volumes, got %v", want, mounts)
+	}
+	for _, key := range []string{"rabbitmq-password", "rabbitmq-erlang-cookie", "rabbitmq-admin-password"} {
+		path := "secrets/rabbit-secrets/" + key
+		if _, ok := result.ConfigFiles[path]; !ok {
+			t.Errorf("expected materialized file %q, files=%v", path, mapKeys(result.ConfigFiles))
+		}
+	}
+}
+
+// TestConvert_ProjectedVolume_ItemsRemap covers k8s' KeyToPath
+// remapping: only specific keys are projected, optionally under
+// different filenames. Used by charts that want to expose a single
+// key from a multi-key Secret.
+func TestConvert_ProjectedVolume_ItemsRemap(t *testing.T) {
+	manifests := &kube.Manifests{
+		Secrets: []kube.Secret{{
+			Metadata: kube.ObjectMeta{Name: "tls"},
+			StringData: map[string]string{
+				"tls.crt": "CERT",
+				"tls.key": "KEY",
+				"unused":  "ignored",
+			},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{{
+							Name: "tls-bundle",
+							Projected: &kube.ProjectedVol{
+								Sources: []kube.ProjectedSource{{
+									Secret: &kube.ProjectedSecretSource{
+										Name: "tls",
+										Items: []kube.KeyToPath{
+											{Key: "tls.crt", Path: "server.crt"},
+											{Key: "tls.key", Path: "server.key"},
+										},
+									},
+								}},
+							},
+						}},
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "example/app",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "tls-bundle", MountPath: "/etc/ssl/private"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if _, ok := result.ConfigFiles["secrets/tls-bundle/server.crt"]; !ok {
+		t.Errorf("remapped key 'server.crt' should be materialized; got %v", mapKeys(result.ConfigFiles))
+	}
+	if _, ok := result.ConfigFiles["secrets/tls-bundle/server.key"]; !ok {
+		t.Errorf("remapped key 'server.key' should be materialized; got %v", mapKeys(result.ConfigFiles))
+	}
+	if _, ok := result.ConfigFiles["secrets/tls-bundle/unused"]; ok {
+		t.Errorf("unselected key 'unused' should NOT be materialized when items list is given")
+	}
+}
+
+// TestConvert_ProjectedVolume_MixedSources confirms a projected
+// volume can combine a Secret and a ConfigMap in the same target
+// directory (Bitnami nginx, several others). Secret presence wins
+// the prefix decision so the dir lands under secrets/ and gets
+// k8s-default 0644 mode at write time.
+func TestConvert_ProjectedVolume_MixedSources(t *testing.T) {
+	manifests := &kube.Manifests{
+		ConfigMaps: []kube.ConfigMap{{
+			Metadata: kube.ObjectMeta{Name: "app-config"},
+			Data:     map[string]string{"app.conf": "hello"},
+		}},
+		Secrets: []kube.Secret{{
+			Metadata:   kube.ObjectMeta{Name: "app-secret"},
+			StringData: map[string]string{"token": "tk"},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{{
+							Name: "bundle",
+							Projected: &kube.ProjectedVol{
+								Sources: []kube.ProjectedSource{
+									{ConfigMap: &kube.ProjectedConfigMapSource{Name: "app-config"}},
+									{Secret: &kube.ProjectedSecretSource{Name: "app-secret"}},
+								},
+							},
+						}},
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "example/app",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "bundle", MountPath: "/etc/app"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	for _, want := range []string{"secrets/bundle/app.conf", "secrets/bundle/token"} {
+		if _, ok := result.ConfigFiles[want]; !ok {
+			t.Errorf("expected materialized %q; got %v", want, mapKeys(result.ConfigFiles))
+		}
+	}
+}
+
 // TestConvert_FQDNAliases_HeadlessStatefulSet covers the failure
 // mode where a Bitnami helm chart bakes a connection string like
 // `nats-0.nats-headless.default.svc.cluster.local` into Secret env

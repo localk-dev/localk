@@ -141,6 +141,7 @@ type VolumeMount struct {
 
 type Volume struct {
 	Name      string        `yaml:"name"`
+	Projected *ProjectedVol `yaml:"projected,omitempty"`
 	ConfigMap *ConfigMapVol `yaml:"configMap,omitempty"`
 	Secret    *SecretVol    `yaml:"secret,omitempty"`
 	PVC       *PVCVolSource `yaml:"persistentVolumeClaim,omitempty"`
@@ -154,6 +155,49 @@ type ConfigMapVol struct {
 
 type SecretVol struct {
 	SecretName string `yaml:"secretName"`
+}
+
+// ProjectedVol combines several source-of-truth volumes (Secrets,
+// ConfigMaps) into one directory inside the container. Bitnami helm
+// charts use it heavily — e.g. rabbitmq projects its erlang cookie
+// and admin password from a Secret into /opt/bitnami/rabbitmq/secrets/
+// where the entrypoint scripts expect them.
+type ProjectedVol struct {
+	Sources []ProjectedSource `yaml:"sources"`
+}
+
+// ProjectedSource is one entry in a projected volume's sources
+// list. Exactly one of the inner pointers is non-nil. We currently
+// support Secret and ConfigMap; downwardAPI / serviceAccountToken
+// are rare in dev stacks and would need separate handling.
+type ProjectedSource struct {
+	Secret    *ProjectedSecretSource    `yaml:"secret,omitempty"`
+	ConfigMap *ProjectedConfigMapSource `yaml:"configMap,omitempty"`
+}
+
+// ProjectedSecretSource references a Secret by name and optionally
+// remaps which keys land in the projected directory and under what
+// filenames. When Items is empty all keys are projected by their
+// own key name.
+type ProjectedSecretSource struct {
+	Name  string      `yaml:"name"`
+	Items []KeyToPath `yaml:"items,omitempty"`
+}
+
+// ProjectedConfigMapSource is the ConfigMap-side sibling of
+// ProjectedSecretSource. Same Items semantics.
+type ProjectedConfigMapSource struct {
+	Name  string      `yaml:"name"`
+	Items []KeyToPath `yaml:"items,omitempty"`
+}
+
+// KeyToPath remaps a source key to a different relative path inside
+// the projected directory. K8s also supports a Mode field per item;
+// we ignore it (the bulk default-mode logic in cmd/localk handles
+// the cases we've seen in real charts).
+type KeyToPath struct {
+	Key  string `yaml:"key"`
+	Path string `yaml:"path"`
 }
 
 type PVCVolSource struct {
