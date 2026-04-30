@@ -359,6 +359,42 @@ and the totals so the decision is visible:
 warning: memory limits scaled to 28.4% (factor 0.284) to fit Docker's 16.0 GB available — declared total 56.3 GB, scaled to 16.0 GB. Pass --memory=preserve to keep declared values, --memory=drop to remove limits entirely.
 ```
 
+## Platform pinning (`--platform`)
+
+Many private registries (especially GitLab CI defaults) only build
+amd64 images. On Apple Silicon or ARM Linux, `docker compose pull`
+returns "no matching manifest for linux/arm64/v8 in the manifest list
+entries" and the whole stack aborts before a single container starts.
+
+By default, `localk generate` detects the host arch via Go's
+`runtime.GOARCH`. On an arm64 host, it pins **every** service to
+`platform: linux/amd64` so Docker pulls amd64 manifests and runs them
+under Rosetta 2 / QEMU emulation. On amd64 hosts, the pinning is a
+no-op (the host's native arch already matches what registries default
+to).
+
+Modes:
+
+```bash
+localk generate ./k8s/                       # auto: arm64 host → pin amd64
+localk generate ./k8s/ --platform=native     # never pin (multi-arch registry)
+localk generate ./k8s/ --platform=linux/amd64   # explicit, ignore host arch
+localk generate ./k8s/ --platform=linux/arm64   # works for any literal value
+```
+
+When auto-pinning fires, you'll see a one-line warning explaining
+what was changed and how to opt out:
+
+```text
+warning: platform pinned to linux/amd64 on every service (host is arm64; most private registries ship amd64-only and would fail with 'no matching manifest'). Pass --platform=native to skip pinning, --platform=<value> to override.
+```
+
+Performance note: under emulation, CPU-bound workloads (databases
+under heavy load, JIT compilers) run noticeably slower than native.
+For dev workloads it's almost always fine. If you hit a service that
+genuinely needs native arm64, override it via `localk.yaml` to point
+at a multi-arch image (or build it locally).
+
 ## Previewing the output (`--dry-run`)
 
 Add `--dry-run` to any `generate` invocation to print exactly what would be

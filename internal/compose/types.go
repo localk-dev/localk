@@ -31,6 +31,11 @@ type Service struct {
 	// namespace via "service:<name>", matching the k8s "all containers in
 	// a pod share an IP" model. Mutually exclusive with Ports.
 	NetworkMode string `yaml:"network_mode,omitempty"`
+	// Platform pins the image variant compose pulls — typically
+	// "linux/amd64" when the host is Apple Silicon and the registry
+	// only ships amd64 builds. Empty means "no preference" (Docker
+	// picks based on the host arch).
+	Platform string `yaml:"platform,omitempty"`
 }
 
 // DependsOnSpec is the long-form depends_on entry. Common conditions:

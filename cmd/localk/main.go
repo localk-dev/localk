@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/goccy/go-yaml"
@@ -123,6 +124,7 @@ func runGenerate(args []string) {
 	configPath := fs.String("config", "localk.yaml", "path to localk.yaml override file (silently ignored if missing)")
 	memoryMode := fs.String("memory", "auto", "memory limit policy: auto (scale to fit Docker memory), preserve (declared k8s values), drop (no limits)")
 	cpuMode := fs.String("cpu", "auto", "CPU limit policy: auto (scale to fit Docker CPU count), preserve (declared k8s values), drop (no limits)")
+	platformMode := fs.String("platform", "auto", "platform pinning policy: auto (set linux/amd64 on arm64 hosts), native (no pinning), or a literal value like linux/amd64")
 
 	args = reorderFlagsFirst(args)
 	if err := fs.Parse(args); err != nil {
@@ -186,6 +188,11 @@ func runGenerate(args []string) {
 	// up with a compose file that asks for 100+ GB of RAM. The
 	// --memory / --cpu flags override.
 	convert.RebalanceResources(result, convert.ResourceMode(*memoryMode), convert.ResourceMode(*cpuMode), convert.DockerProbe{})
+
+	// Platform pinning. Default `auto` sets linux/amd64 on arm64
+	// hosts (M-series Macs) so amd64-only private registries don't
+	// produce "no matching manifest" pull errors. amd64 hosts: no-op.
+	convert.ApplyPlatform(result, convert.PlatformMode(*platformMode), runtime.GOARCH)
 
 	composeBytes, err := yaml.Marshal(result.Compose)
 	if err != nil {
@@ -456,6 +463,8 @@ func reorderFlagsFirst(args []string) []string {
 		"--memory":         true,
 		"-cpu":             true,
 		"--cpu":            true,
+		"-platform":        true,
+		"--platform":       true,
 		"-port":            true,
 		"--port":           true,
 		"-container-port":  true,
