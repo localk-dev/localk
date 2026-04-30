@@ -34,13 +34,42 @@ and complexity of running a real cluster on your laptop.
 
 ## Install
 
-> Pre-built binaries and Homebrew formula coming with the first release.
+### Pre-built binaries (recommended)
 
-For now, build from source:
+Download the latest release from
+[github.com/localk-dev/localk/releases](https://github.com/localk-dev/localk/releases)
+or grab it directly:
+
+```bash
+# macOS Apple Silicon
+curl -L https://github.com/localk-dev/localk/releases/latest/download/localk_$(curl -fsSL https://api.github.com/repos/localk-dev/localk/releases/latest | grep tag_name | cut -d'"' -f4 | sed 's/^v//')_darwin_arm64.tar.gz | tar xz
+```
+
+For other platforms, the asset names follow
+`localk_<version>_<os>_<arch>.tar.gz` (or `.zip` for Windows). Each
+archive contains the `localk` binary plus `LICENSE` and `README.md`.
+Move `localk` somewhere on your `$PATH`:
+
+```bash
+sudo mv localk /usr/local/bin/
+localk version
+```
+
+Verify with the release's `checksums.txt` — every asset's SHA256 is
+published alongside the binaries.
+
+### From source
 
 ```bash
 go install github.com/localk-dev/localk/cmd/localk@latest
 ```
+
+Requires Go 1.22+.
+
+### Homebrew
+
+Coming once the `localk-dev/homebrew-tap` repo is published — `.goreleaser.yaml`
+is already wired for it.
 
 ## Quick start
 
