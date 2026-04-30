@@ -1051,6 +1051,74 @@ func TestConvert_InitContainer_SharedVolume(t *testing.T) {
 	}
 }
 
+// TestConvert_EmptyDir_MultiMountStaysAnonymous covers the Bitnami
+// pattern: one container mounts a single emptyDir at multiple paths
+// as separate scratch directories. Promoting it to a named compose
+// volume would mean every path shows the same data — which broke
+// rabbitmq's setup script (it complained that
+// .../var/lib/rabbitmq/.erlang.cookie and .../.rabbitmq/.erlang.cookie
+// resolved to the same file). Each mount must stay anonymous.
+func TestConvert_EmptyDir_MultiMountStaysAnonymous(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "rabbitmq"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "rabbitmq"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "rabbitmq"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{
+							{Name: "empty-dir", EmptyDir: &kube.EmptyDirVol{}},
+						},
+						Containers: []kube.Container{{
+							Name:  "rabbitmq",
+							Image: "bitnami/rabbitmq:3.13",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "empty-dir", MountPath: "/tmp"},
+								{Name: "empty-dir", MountPath: "/opt/bitnami/rabbitmq/etc"},
+								{Name: "empty-dir", MountPath: "/opt/bitnami/rabbitmq/var/lib"},
+								{Name: "empty-dir", MountPath: "/opt/bitnami/rabbitmq/.rabbitmq"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	if _, ok := result.Compose.Volumes["rabbitmq-empty-dir"]; ok {
+		t.Errorf("multi-mount within a single container should NOT promote to a named volume; compose.Volumes = %v", result.Compose.Volumes)
+	}
+	got := result.Compose.Services["rabbitmq"].Volumes
+	want := []string{
+		"/tmp",
+		"/opt/bitnami/rabbitmq/etc",
+		"/opt/bitnami/rabbitmq/var/lib",
+		"/opt/bitnami/rabbitmq/.rabbitmq",
+	}
+	for _, w := range want {
+		found := false
+		for _, v := range got {
+			if v == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected anonymous mount %q in service volumes, got %v", w, got)
+		}
+	}
+	for _, v := range got {
+		if strings.Contains(v, "rabbitmq-empty-dir:") {
+			t.Errorf("no mount should reference the named volume 'rabbitmq-empty-dir', got %q", v)
+		}
+	}
+}
+
 // TestConvert_NoSidecarsForSingleContainer is the regression guard:
 // pods with one container shouldn't gain any sidecar services or
 // network_mode tweaks.

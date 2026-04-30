@@ -259,7 +259,7 @@ func convertPod(
 	// silently breaks.
 	allContainers := append([]kube.Container{}, w.pod.Spec.InitContainers...)
 	allContainers = append(allContainers, containers...)
-	shared := sharedVolumeNames(allContainers)
+	decision := shareDecisionFor(allContainers)
 
 	extras := map[string]compose.Service{}
 
@@ -270,7 +270,7 @@ func convertPod(
 	// init with condition: service_completed_successfully.
 	var initNames []string
 	for i, c := range w.pod.Spec.InitContainers {
-		s, w2 := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, configFiles)
+		s, w2 := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles)
 		warnings = append(warnings, w2...)
 		s.Restart = "no"
 		name := mainName + "-" + c.Name
@@ -284,7 +284,7 @@ func convertPod(
 	}
 
 	// --- Main container.
-	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, configFiles)
+	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles)
 	warnings = append(warnings, mainWarnings...)
 
 	// Service-derived ports are published only by the main's service.
@@ -304,7 +304,7 @@ func convertPod(
 
 	// --- Sidecars (run alongside main, sharing its network namespace).
 	for _, c := range containers[1:] {
-		sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, shared, configFiles)
+		sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles)
 		warnings = append(warnings, scWarnings...)
 		sc.NetworkMode = "service:" + mainName
 		extras[mainName+"-"+c.Name] = sc
@@ -326,9 +326,10 @@ func buildContainerService(
 	out *compose.File,
 	envFileLines *[]string,
 	envFileSeen map[string]bool,
-	shared map[string]bool,
+	decision shareDecision,
 	configFiles map[string]string,
 ) (compose.Service, []string) {
+	multiMount := multiMountedNames(c)
 	var warnings []string
 
 	svc := compose.Service{
@@ -450,7 +451,7 @@ func buildContainerService(
 			))
 			continue
 		}
-		entry, declareName, declared, files, perEntryWarnings := volumeEntryFor(volSrc, vm, shared, w.name, m)
+		entry, declareName, declared, files, perEntryWarnings := volumeEntryFor(volSrc, vm, decision, multiMount[vm.Name], w.name, m)
 		if entry != "" {
 			svc.Volumes = append(svc.Volumes, entry)
 		}
@@ -483,19 +484,85 @@ func buildContainerService(
 	return svc, warnings
 }
 
-// sharedVolumeNames returns the set of pod volume names referenced by 2+
-// containers — the candidates for promoting an emptyDir to a named volume
-// so all containers see the same data.
-func sharedVolumeNames(containers []kube.Container) map[string]bool {
-	count := map[string]int{}
+// shareDecision is the pod-level verdict the volume code uses to
+// decide whether each mount becomes a named-volume mount or an
+// anonymous scratch mount.
+type shareDecision struct {
+	// pairShared lists (name|mountPath) keys that appear in 2+
+	// containers — the explicit "this exact path is shared" case
+	// (init→main plugin dir, main+sidecar log dir).
+	pairShared map[string]bool
+	// nameInContainers counts how many distinct containers reference
+	// each volume name. ≥2 means there's potential cross-container
+	// sharing even if mount paths differ — the simple init+main case
+	// where init has /out and main has /etc/app, both meaning to
+	// share the underlying volume.
+	nameInContainers map[string]int
+}
+
+// shareDecisionFor analyzes the pod's containers and returns the
+// promotion-vs-anonymous information needed for volumeEntryFor.
+// The richer return shape (vs a flat shared-name set) lets
+// volumeEntryFor handle all three real-world patterns:
+//
+//  1. Simple init+main with different paths (config at /out and /etc/app)
+//     — by-name shared, each container mounts once → promote.
+//  2. Bitnami main with one volume at many paths
+//     — by-name shared but multi-mounted in this container → only
+//     paths that are ALSO in another container promote; the rest
+//     stay anonymous so each path is independent scratch.
+//  3. Single-container scratch — neither shared → anonymous.
+func shareDecisionFor(containers []kube.Container) shareDecision {
+	d := shareDecision{
+		pairShared:       map[string]bool{},
+		nameInContainers: map[string]int{},
+	}
+	pairCount := map[string]int{}
 	for _, c := range containers {
-		seen := map[string]bool{} // dedupe within a single container
+		seenPair := map[string]bool{}
+		seenName := map[string]bool{}
 		for _, vm := range c.VolumeMounts {
-			if !seen[vm.Name] {
-				seen[vm.Name] = true
-				count[vm.Name]++
+			pkey := vm.Name + "|" + vm.MountPath
+			if !seenPair[pkey] {
+				seenPair[pkey] = true
+				pairCount[pkey]++
 			}
+			seenName[vm.Name] = true
 		}
+		for name := range seenName {
+			d.nameInContainers[name]++
+		}
+	}
+	for k, n := range pairCount {
+		if n > 1 {
+			d.pairShared[k] = true
+		}
+	}
+	return d
+}
+
+// shouldPromote is the rule for a specific mount in a specific
+// container. inMultiMountContainer is per-container — a volume might
+// be multi-mounted in main but single-mounted in init, and the rule
+// applies independently to each.
+func (d shareDecision) shouldPromote(volumeName, mountPath string, inMultiMountContainer bool) bool {
+	if d.pairShared[volumeName+"|"+mountPath] {
+		return true
+	}
+	if d.nameInContainers[volumeName] >= 2 && !inMultiMountContainer {
+		return true
+	}
+	return false
+}
+
+// multiMountedNames returns the set of volume names this specific
+// container mounts at more than one path — Bitnami's per-path scratch
+// pattern. shouldPromote uses this to suppress the by-name fallback
+// for those mounts so each path stays independent.
+func multiMountedNames(c kube.Container) map[string]bool {
+	count := map[string]int{}
+	for _, vm := range c.VolumeMounts {
+		count[vm.Name]++
 	}
 	out := map[string]bool{}
 	for name, n := range count {
@@ -532,16 +599,18 @@ func findVolume(vols []kube.Volume, name string) *kube.Volume {
 //   - warnings: things the user should know (missing CM/Secret refs,
 //     mostly)
 //
-// shared lists volume names referenced by 2+ containers in the same
-// pod. When an emptyDir falls into that set we promote it to a named
-// compose volume (prefixed with the workload name to avoid collisions)
-// so every container sharing it sees the same data.
-func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, shared map[string]bool, workloadName string, m *kube.Manifests) (string, string, bool, map[string]string, []string) {
+// decision carries the pod-level share analysis; inMultiMount says
+// whether THIS specific container mounts this volume name at >1 path
+// (Bitnami's per-path scratch pattern). Together they decide whether
+// an emptyDir gets promoted to a named compose volume (so multiple
+// containers see the same data) or stays anonymous (so each path is
+// independent scratch).
+func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, decision shareDecision, inMultiMount bool, workloadName string, m *kube.Manifests) (string, string, bool, map[string]string, []string) {
 	switch {
 	case v.PVC != nil:
 		return fmt.Sprintf("%s:%s", v.PVC.ClaimName, vm.MountPath), v.PVC.ClaimName, true, nil, nil
 	case v.EmptyDir != nil:
-		if shared[v.Name] {
+		if decision.shouldPromote(v.Name, vm.MountPath, inMultiMount) {
 			named := workloadName + "-" + v.Name
 			return fmt.Sprintf("%s:%s", named, vm.MountPath), named, true, nil, nil
 		}
