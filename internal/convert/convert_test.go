@@ -1043,8 +1043,8 @@ func TestConvert_EscapesDollarsForCompose(t *testing.T) {
 					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "shellish"}},
 					Spec: kube.PodSpec{
 						Containers: []kube.Container{{
-							Name:  "shellish",
-							Image: "alpine",
+							Name:    "shellish",
+							Image:   "alpine",
 							Command: []string{"sh", "-ec", `work_dir="$(pwd)"; cd "$XDG_CONFIG_HOME"`},
 							Args:    []string{"--profile", "$ENV_NAME"},
 							Env: []kube.EnvVar{
@@ -1115,8 +1115,8 @@ func equalStringSlices(a, b []string) bool {
 // plain bytes, which compose accepts losslessly.
 func TestConvert_MemoryUnits(t *testing.T) {
 	cases := []struct {
-		k8sValue       string
-		composeWanted  string
+		k8sValue      string
+		composeWanted string
 	}{
 		// Binary (k8s default) — bug-fix targets.
 		{"512Mi", "536870912"},
@@ -1132,9 +1132,9 @@ func TestConvert_MemoryUnits(t *testing.T) {
 		{"2gi", "2147483648"},
 		// Edge cases: pass-through where appropriate.
 		{"", ""},
-		{"42", "42"},        // already bytes-as-number
-		{"5xyz", "5xyz"},    // unknown suffix — let compose error
-		{"junk", "junk"},    // no digits — pass through
+		{"42", "42"},     // already bytes-as-number
+		{"5xyz", "5xyz"}, // unknown suffix — let compose error
+		{"junk", "junk"}, // no digits — pass through
 	}
 
 	for _, tc := range cases {

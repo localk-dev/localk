@@ -121,6 +121,8 @@ func runGenerate(args []string) {
 	fs.BoolVar(yes, "yes", false, "skip the confirmation prompt in cluster mode")
 	dryRun := fs.Bool("dry-run", false, "print what would be written without touching disk (.env values redacted)")
 	configPath := fs.String("config", "localk.yaml", "path to localk.yaml override file (silently ignored if missing)")
+	memoryMode := fs.String("memory", "auto", "memory limit policy: auto (scale to fit Docker memory), preserve (declared k8s values), drop (no limits)")
+	cpuMode := fs.String("cpu", "auto", "CPU limit policy: auto (scale to fit Docker CPU count), preserve (declared k8s values), drop (no limits)")
 
 	args = reorderFlagsFirst(args)
 	if err := fs.Parse(args); err != nil {
@@ -177,6 +179,13 @@ func runGenerate(args []string) {
 	if err != nil {
 		fail("converting manifests: %v", err)
 	}
+
+	// Resource rebalance pass. By default this auto-scales memory/CPU
+	// limits to fit Docker's reported capacity (with a safety margin)
+	// so users with prod-sized limits in their manifests don't end
+	// up with a compose file that asks for 100+ GB of RAM. The
+	// --memory / --cpu flags override.
+	convert.RebalanceResources(result, convert.ResourceMode(*memoryMode), convert.ResourceMode(*cpuMode), convert.DockerProbe{})
 
 	composeBytes, err := yaml.Marshal(result.Compose)
 	if err != nil {
@@ -443,6 +452,10 @@ func reorderFlagsFirst(args []string) []string {
 		"--out-dir":        true,
 		"-config":          true,
 		"--config":         true,
+		"-memory":          true,
+		"--memory":         true,
+		"-cpu":             true,
+		"--cpu":            true,
 		"-port":            true,
 		"--port":           true,
 		"-container-port":  true,

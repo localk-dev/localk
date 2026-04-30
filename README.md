@@ -314,6 +314,51 @@ the proxy is what's keeping the network DNS working for the rest of
 the stack. Run `localk dev --stop <service>` first if you need it
 disabled.
 
+## Resource limits (`--memory` / `--cpu`)
+
+Real-world k8s manifests routinely declare per-service memory and CPU
+limits sized for prod hosts (e.g., `database: 32Gi`, `analytics: 16Gi`,
+`api: 5Gi` × dozens of services). Sum those across a 60-service stack
+and you've asked for far more than a developer laptop has. Without
+intervention, a straight translation produces a compose file that
+can't actually start the stack — Docker Desktop's VM allocation is
+typically 8–16 GB.
+
+By default, `localk generate` detects Docker's available memory and
+CPU via `docker info` and **scales every declared limit
+proportionally** so the stack fits. Relative weights from the manifest
+are preserved (a service that asks for 4× more memory than another
+still gets 4× more, just at laptop scale). A safety margin of 20% is
+left to the host kernel.
+
+```bash
+localk generate ./k8s/                  # default: scale to fit Docker (auto)
+localk generate ./k8s/ --memory=preserve  # emit declared values verbatim
+localk generate ./k8s/ --memory=drop      # remove limits entirely
+
+# Same flags exist for CPU:
+localk generate ./k8s/ --cpu=auto
+localk generate ./k8s/ --cpu=preserve
+localk generate ./k8s/ --cpu=drop
+```
+
+Modes:
+- **`auto`** (default) — scale proportionally to fit `docker info`'s
+  reported total. If Docker isn't running or `docker info` fails,
+  silently falls back to `preserve` so generation works offline.
+- **`preserve`** — emit the k8s-declared values exactly. Use when you
+  want to keep the original limits visible in the compose file.
+- **`drop`** — remove the limits entirely. The kernel arbitrates based
+  on actual demand. Often the right choice on a dev laptop where
+  prod-scheduling-grade limits aren't useful.
+
+When `auto` actually scales, you'll see a warning naming the factor
+and the totals so the decision is visible:
+
+```text
+warning: memory limits scaled to 28.4% (factor 0.284) to fit Docker's 16.0 GB available — declared total 56.3 GB, scaled to 16.0 GB. Pass --memory=preserve to keep declared values, --memory=drop to remove limits entirely.
+```
+
 ## Previewing the output (`--dry-run`)
 
 Add `--dry-run` to any `generate` invocation to print exactly what would be
