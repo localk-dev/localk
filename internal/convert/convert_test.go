@@ -1697,6 +1697,124 @@ func TestConvert_SecretVolumeMount_SubPath(t *testing.T) {
 	}
 }
 
+// TestConvert_FQDNAliases_HeadlessStatefulSet covers the failure
+// mode where a Bitnami helm chart bakes a connection string like
+// `nats-0.nats-headless.default.svc.cluster.local` into Secret env
+// vars. The StatefulSet plus a clusterIP=None Service make those
+// FQDNs resolvable in k8s; in compose they're nonsense unless we
+// add network aliases to the converted service.
+func TestConvert_FQDNAliases_HeadlessStatefulSet(t *testing.T) {
+	manifests := &kube.Manifests{
+		Services: []kube.Service{
+			{
+				Metadata: kube.ObjectMeta{Name: "nats", Namespace: "default"},
+				Spec: kube.ServiceSpec{
+					Selector: map[string]string{"app": "nats"},
+					Ports:    []kube.ServicePort{{Port: 4222}},
+				},
+			},
+			{
+				Metadata: kube.ObjectMeta{Name: "nats-headless", Namespace: "default"},
+				Spec: kube.ServiceSpec{
+					Selector:  map[string]string{"app": "nats"},
+					Ports:     []kube.ServicePort{{Port: 4222}},
+					ClusterIP: "None",
+				},
+			},
+		},
+		StatefulSets: []kube.StatefulSet{{
+			Metadata: kube.ObjectMeta{Name: "nats", Namespace: "default"},
+			Spec: kube.StatefulSetSpec{
+				Replicas: 3,
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "nats"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "nats"}},
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{{
+							Name:  "nats",
+							Image: "nats:2-alpine",
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	got := result.Compose.Services["nats"].Networks["default"].Aliases
+	mustHave := []string{
+		// non-headless ClusterIP service forms
+		"nats.default",
+		"nats.default.svc",
+		"nats.default.svc.cluster.local",
+		// headless sibling service forms
+		"nats-headless",
+		"nats-headless.default",
+		"nats-headless.default.svc",
+		"nats-headless.default.svc.cluster.local",
+		// pod-N forms (headless + StatefulSet)
+		"nats-0",
+		"nats-1",
+		"nats-2",
+		"nats-0.nats-headless.default.svc.cluster.local",
+		"nats-1.nats-headless.default.svc.cluster.local",
+		"nats-2.nats-headless.default.svc.cluster.local",
+	}
+	have := map[string]bool{}
+	for _, a := range got {
+		have[a] = true
+	}
+	for _, want := range mustHave {
+		if !have[want] {
+			t.Errorf("missing FQDN alias %q in %v", want, got)
+		}
+	}
+	// The compose service name itself should not appear as an alias —
+	// compose's embedded DNS already resolves it.
+	if have["nats"] {
+		t.Errorf("alias list should not include the compose service name itself, got %v", got)
+	}
+}
+
+// TestConvert_FQDNAliases_DeploymentNoPodOrdinals guards against
+// emitting StatefulSet-style pod-N aliases for plain Deployments,
+// which don't have stable pod hostnames.
+func TestConvert_FQDNAliases_DeploymentNoPodOrdinals(t *testing.T) {
+	manifests := &kube.Manifests{
+		Services: []kube.Service{{
+			Metadata: kube.ObjectMeta{Name: "api", Namespace: "default"},
+			Spec: kube.ServiceSpec{
+				Selector: map[string]string{"app": "api"},
+				Ports:    []kube.ServicePort{{Port: 3000}},
+			},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "api", Namespace: "default"},
+			Spec: kube.DeploymentSpec{
+				Replicas: 3,
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "api"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "api"}},
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{{Name: "api", Image: "example/api"}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	for _, a := range result.Compose.Services["api"].Networks["default"].Aliases {
+		if strings.HasPrefix(a, "api-0") || strings.HasPrefix(a, "api-1") || strings.HasPrefix(a, "api-2") {
+			t.Errorf("Deployments shouldn't get pod-N aliases, got %q", a)
+		}
+	}
+}
+
 func mapKeys(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

@@ -269,6 +269,26 @@ func (m *Manifests) FindServiceForSelector(podLabels map[string]string) *Service
 	return nil
 }
 
+// FindAllServicesForSelector returns every Service whose selector
+// matches the pod's labels. Pods are commonly fronted by both a
+// regular ClusterIP Service AND a "headless" sibling (e.g. `nats`
+// + `nats-headless`); the headless one is what StatefulSet
+// pod-DNS uses. The converter needs all of them to compute network
+// aliases for every FQDN form the pod could be reached at.
+func (m *Manifests) FindAllServicesForSelector(podLabels map[string]string) []*Service {
+	var out []*Service
+	for i := range m.Services {
+		sel := m.Services[i].Spec.Selector
+		if len(sel) == 0 {
+			continue
+		}
+		if labelsMatch(sel, podLabels) {
+			out = append(out, &m.Services[i])
+		}
+	}
+	return out
+}
+
 func labelsMatch(selector, labels map[string]string) bool {
 	for k, v := range selector {
 		if labels[k] != v {

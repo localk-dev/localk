@@ -26,7 +26,12 @@ type Service struct {
 	DependsOn map[string]DependsOnSpec `yaml:"depends_on,omitempty"`
 	Restart   string                   `yaml:"restart,omitempty"`
 	Deploy    *Deploy                  `yaml:"deploy,omitempty"`
-	Networks  []string                 `yaml:"networks,omitempty"`
+	// Networks attaches the service to one or more compose networks.
+	// We use the long form (map[name]ServiceNetwork) so we can express
+	// per-network aliases — the mechanism that makes k8s-style FQDNs
+	// like `nats-headless.default.svc.cluster.local` resolve inside
+	// the compose network without changing the service name itself.
+	Networks map[string]ServiceNetwork `yaml:"networks,omitempty"`
 	// NetworkMode lets a sidecar service share another service's network
 	// namespace via "service:<name>", matching the k8s "all containers in
 	// a pod share an IP" model. Mutually exclusive with Ports.
@@ -75,4 +80,11 @@ type Volume struct {
 // Network is a top-level network declaration.
 type Network struct {
 	Driver string `yaml:"driver,omitempty"`
+}
+
+// ServiceNetwork is the per-service network entry used to declare
+// network aliases (additional DNS names that resolve to the service
+// inside the compose network).
+type ServiceNetwork struct {
+	Aliases []string `yaml:"aliases,omitempty"`
 }

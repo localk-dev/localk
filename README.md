@@ -528,6 +528,46 @@ applies to `StatefulSet`s: each `volumeClaimTemplate` becomes a named
 compose volume prefixed with the workload name, so two stateful services
 that both call their data volume "data" don't collide.
 
+### k8s FQDN aliases
+
+Manifests routinely bake fully-qualified DNS names like
+`api.default.svc.cluster.local` into Secret/ConfigMap env vars
+(Bitnami helm charts always do this). Compose has no cluster DNS,
+so without help these lookups fail.
+
+For every workload, localk emits compose network aliases covering
+the four cluster-DNS forms:
+
+```yaml
+services:
+  api:
+    networks:
+      default:
+        aliases:
+          - api.default
+          - api.default.svc
+          - api.default.svc.cluster.local
+```
+
+When a `StatefulSet` is fronted by a headless `Service` (`clusterIP:
+None`), pod-ordinal forms get added too:
+
+```yaml
+nats:
+  networks:
+    default:
+      aliases:
+        - nats-headless.default.svc.cluster.local
+        - nats-0.nats-headless.default.svc.cluster.local
+        - nats-1.nats-headless.default.svc.cluster.local
+        - nats-2.nats-headless.default.svc.cluster.local
+```
+
+Compose still runs a single container per workload, but every
+ordinal alias resolves to it — so apps that loop over
+`<sts>-0`, `<sts>-1`, `<sts>-2` connection strings hit the same
+backend instead of failing with `ENOTFOUND`.
+
 ### Sidecar containers
 
 Real-world pods routinely have a main container plus one or more

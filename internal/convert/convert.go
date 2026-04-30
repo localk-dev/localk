@@ -133,8 +133,15 @@ func applyServiceOverride(svc *compose.Service, ov config.ServiceOverride) {
 // matters is the pod template (containers, env, volumes) plus any
 // volumeClaimTemplates that need to materialize as named compose volumes.
 type workload struct {
-	kindLabel    string // "deployment" / "statefulset", used in warning messages
-	name         string // metadata.name from the workload
+	kindLabel string // "deployment" / "statefulset", used in warning messages
+	name      string // metadata.name from the workload
+	namespace string // metadata.namespace, "" means "default"
+	// replicas is the workload's replica count, used when generating
+	// StatefulSet pod-N FQDN aliases (mongodb-0, mongodb-1, ...).
+	// 0 means "compose still runs a single container" — but the alias
+	// list still needs to cover any pod ordinal that other services
+	// might address via cluster DNS, so we treat 0 as 1.
+	replicas     int32
 	pod          kube.PodTemplate
 	volumeClaims []kube.PersistentVolumeClaimTemplate
 }
@@ -143,6 +150,8 @@ func workloadFromDeployment(d *kube.Deployment) workload {
 	return workload{
 		kindLabel: "deployment",
 		name:      d.Metadata.Name,
+		namespace: d.Metadata.Namespace,
+		replicas:  d.Spec.Replicas,
 		pod:       d.Spec.Template,
 	}
 }
@@ -151,6 +160,8 @@ func workloadFromStatefulSet(s *kube.StatefulSet) workload {
 	return workload{
 		kindLabel:    "statefulset",
 		name:         s.Metadata.Name,
+		namespace:    s.Metadata.Namespace,
+		replicas:     s.Spec.Replicas,
 		pod:          s.Spec.Template,
 		volumeClaims: s.Spec.VolumeClaimTemplates,
 	}
@@ -229,6 +240,75 @@ func serviceName(w workload, m *kube.Manifests) string {
 	return w.name
 }
 
+// fqdnAliasesFor returns the set of compose network aliases that
+// reproduce k8s in-cluster DNS for one workload.
+//
+// k8s services are reachable at any of:
+//
+//	<svc>
+//	<svc>.<ns>
+//	<svc>.<ns>.svc
+//	<svc>.<ns>.svc.cluster.local
+//
+// Manifests routinely bake the longest form into ConfigMap/Secret
+// env vars (Bitnami helm charts always do this), so the only safe
+// approach is to alias every form to the compose service.
+//
+// For StatefulSets fronted by a headless Service, pods are also
+// addressable as `<sts>-<i>.<headless>.<ns>.svc.cluster.local`. We
+// generate aliases for ordinals 0..(replicas-1); compose still runs
+// a single container, but at least the DNS resolves so apps that
+// loop over `<sts>-0`, `<sts>-1`, `<sts>-2` connection strings hit
+// the same backend instead of failing with ENOTFOUND.
+//
+// `mainName` is the compose service name we're attaching aliases to.
+// It's deliberately omitted from the alias list (compose's embedded
+// DNS already resolves it as the service name).
+func fqdnAliasesFor(mainName string, w workload, services []*kube.Service) []string {
+	if len(services) == 0 {
+		return nil
+	}
+	replicas := w.replicas
+	if replicas < 1 {
+		replicas = 1
+	}
+	seen := map[string]bool{mainName: true}
+	var out []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	suffixes := func(name, ns string) {
+		add(name)
+		add(name + "." + ns)
+		add(name + "." + ns + ".svc")
+		add(name + "." + ns + ".svc.cluster.local")
+	}
+	for _, s := range services {
+		ns := s.Metadata.Namespace
+		if ns == "" {
+			ns = "default"
+		}
+		suffixes(s.Metadata.Name, ns)
+
+		// Headless services (clusterIP: None) front StatefulSet pods
+		// individually. Generate per-pod FQDNs only for that case so
+		// regular ClusterIP services don't bloat the alias list.
+		if w.kindLabel == "statefulset" && s.Spec.ClusterIP == "None" {
+			for i := int32(0); i < replicas; i++ {
+				pod := fmt.Sprintf("%s-%d", w.name, i)
+				add(pod)
+				suffixes(pod+"."+s.Metadata.Name, ns)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // convertPod walks every container in the pod and produces:
 //   - main: the compose service for containers[0], named after the workload
 //   - sidecars: a map of <main>-<container.Name> → compose.Service for any
@@ -291,10 +371,24 @@ func convertPod(
 	// Service-derived ports are published only by the main's service.
 	// Sidecars share that namespace, so a single host:port mapping covers
 	// the whole pod.
-	if matched := m.FindServiceForSelector(w.pod.Metadata.Labels); matched != nil {
-		for _, p := range matched.Spec.Ports {
+	allMatched := m.FindAllServicesForSelector(w.pod.Metadata.Labels)
+	if len(allMatched) > 0 {
+		// Ports come from the first matched Service (typical pattern: a
+		// regular ClusterIP fronts the workload, a headless sibling
+		// exists alongside for StatefulSet pod DNS — the headless one
+		// either has the same ports or none).
+		for _, p := range allMatched[0].Spec.Ports {
 			target := containerPortFromService(p, containers[0])
 			main.Ports = append(main.Ports, fmt.Sprintf("%d:%d", p.Port, target))
+		}
+		// Network aliases let env vars baked with k8s cluster-DNS names
+		// (e.g. `nats-0.nats-headless.default.svc.cluster.local`)
+		// resolve to this compose service. Without them, apps that
+		// pull connection strings from Secrets crash on DNS lookup.
+		if aliases := fqdnAliasesFor(mainName, w, allMatched); len(aliases) > 0 {
+			main.Networks = map[string]compose.ServiceNetwork{
+				"default": {Aliases: aliases},
+			}
 		}
 	}
 	if len(initNames) > 0 {

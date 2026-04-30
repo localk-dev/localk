@@ -188,6 +188,10 @@ type ServiceSpec struct {
 	Type     string            `yaml:"type,omitempty"`
 	Selector map[string]string `yaml:"selector,omitempty"`
 	Ports    []ServicePort     `yaml:"ports"`
+	// ClusterIP is "None" for headless services. The FQDN-alias
+	// generator uses this to decide whether to emit StatefulSet
+	// pod-N forms (only headless services back per-pod DNS).
+	ClusterIP string `yaml:"clusterIP,omitempty"`
 }
 
 type ServicePort struct {
