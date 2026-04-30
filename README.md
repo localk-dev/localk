@@ -130,14 +130,14 @@ transparently reaches your local process.
 # Start the stack
 localk up
 
-# Take `gateway-rental-partner` out of compose and route its traffic
+# Take `api-gateway` out of compose and route its traffic
 # to your laptop on port 3000:
-localk dev gateway-rental-partner --port 3000
+localk dev api-gateway --port 3000
 
 # (Run your service in VSCode / your IDE on localhost:3000)
 
 # When done, put the original service back:
-localk dev --stop gateway-rental-partner
+localk dev --stop api-gateway
 localk up   # bounces the original service back into the stack
 ```
 
@@ -156,10 +156,10 @@ After `localk dev <service> --port <n>`, localk prints:
   paste them into your IDE config.
 
 ```text
-Service "gateway-rental-partner" is now in dev mode.
+Service "api-gateway" is now in dev mode.
 
 Run your code on:        localhost:3000
-Reachable from stack at: http://gateway-rental-partner:80
+Reachable from stack at: http://api-gateway:80
 
 Other services reachable from your laptop:
   postgres                       localhost:5432
@@ -171,7 +171,7 @@ Useful env vars (hostnames remapped for host access — review before pasting):
   REDIS_URL=redis://localhost:6379
   ...
 
-When done: localk dev --stop gateway-rental-partner --out-dir .
+When done: localk dev --stop api-gateway --out-dir .
 ```
 
 Multiple services can be in dev mode simultaneously (each on its own
