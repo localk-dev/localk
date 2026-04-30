@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -168,6 +169,29 @@ func TestReorderFlagsFirst(t *testing.T) {
 			got := reorderFlagsFirst(tc.in)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("reorderFlagsFirst(%v):\n  got  %v\n  want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMaterializedFileMode(t *testing.T) {
+	cases := []struct {
+		path string
+		want os.FileMode
+	}{
+		// Bitnami helm charts mount setup scripts via subPath and exec
+		// them — needs +x on the host file or Docker passes through 0644
+		// and the container fails with "exec: permission denied".
+		{"configs/mongodb-scripts/setup.sh", 0o755},
+		{"configs/nats-config/nats.conf", 0o755},
+		// Secrets stay restrictive: code reads them, never execs.
+		{"secrets/tls/private.pem", 0o600},
+		{"secrets/api/api-key", 0o600},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			if got := materializedFileMode(tc.path); got != tc.want {
+				t.Errorf("materializedFileMode(%q) = %o, want %o", tc.path, got, tc.want)
 			}
 		})
 	}

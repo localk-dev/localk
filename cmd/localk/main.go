@@ -253,12 +253,19 @@ func runGenerate(args []string) {
 	// Compose then bind-mounts the whole directory into the
 	// container, giving the app the same per-key filenames it'd see
 	// in k8s.
+	//
+	// File modes: configs/ get 0755 (executable) — Bitnami helm
+	// charts mount their setup scripts via subPath and `exec` them,
+	// so without +x we'd see "exec ...: permission denied". Secrets
+	// stay at 0600 since they're sensitive cluster data and code
+	// reads them, never execs them.
 	for relPath, content := range result.ConfigFiles {
 		fullPath := filepath.Join(*outDir, relPath)
 		if err := ensureParentDir(fullPath); err != nil {
 			fail("preparing directory for %s: %v", fullPath, err)
 		}
-		if err := writeFile(fullPath, []byte(content)); err != nil {
+		mode := materializedFileMode(relPath)
+		if err := writeFileMode(fullPath, []byte(content), mode); err != nil {
 			fail("writing %s: %v", fullPath, err)
 		}
 	}
@@ -459,6 +466,23 @@ func displayContext(c string) string {
 
 func writeFile(path string, data []byte) error {
 	return os.WriteFile(path, data, 0o644)
+}
+
+func writeFileMode(path string, data []byte, mode os.FileMode) error {
+	return os.WriteFile(path, data, mode)
+}
+
+// materializedFileMode picks the on-disk mode for a config/secret
+// file. ConfigMap-derived files default to 0755 because helm charts
+// (Bitnami especially) commonly mount a single key as an executable
+// script via subPath; without +x the container fails with "exec ...:
+// permission denied". Secret files stay at 0600 since they hold
+// sensitive cluster data and apps read them rather than exec them.
+func materializedFileMode(relPath string) os.FileMode {
+	if strings.HasPrefix(relPath, "secrets/") {
+		return 0o600
+	}
+	return 0o755
 }
 
 // reorderFlagsFirst pulls every -flag (and its argument when separate) to the
