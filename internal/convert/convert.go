@@ -38,7 +38,15 @@ type Result struct {
 	// shares via the host filesystem the way k8s shares via the
 	// kubelet's emptyDir backing.
 	EmptyDirs map[string]bool
-	Warnings  []string
+	// SwappedServices lists services whose image was replaced by
+	// the dev-swap (Bitnami clustered chart → vanilla upstream).
+	// ApplyPlatform consults this to avoid pinning linux/amd64 on
+	// images we know ship multi-arch builds (mongo, rabbitmq, …).
+	// Forcing those through Rosetta on Apple Silicon is both slow
+	// and bug-prone (mongo:7's first-stage setup mongod fails on
+	// bind() with EINVAL under amd64 emulation).
+	SwappedServices map[string]bool
+	Warnings        []string
 }
 
 // Convert translates the given Manifests bundle into a Result. The optional
@@ -50,8 +58,9 @@ func Convert(m *kube.Manifests, cfg *config.Config) (*Result, error) {
 			Services: map[string]compose.Service{},
 			Volumes:  map[string]compose.Volume{},
 		},
-		ConfigFiles: map[string]string{},
-		EmptyDirs:   map[string]bool{},
+		ConfigFiles:     map[string]string{},
+		EmptyDirs:       map[string]bool{},
+		SwappedServices: map[string]bool{},
 	}
 
 	// Track which volumes we have declared at the top level so we don't
@@ -238,6 +247,7 @@ func convertWorkload(
 	// a *_FILE env pointing at a materialized secret on disk.
 	if msg := applyDevSwap(name, &main, extras, override.PreserveImage, envFileLines, envFileSeen, res.ConfigFiles); msg != "" {
 		res.Warnings = append(res.Warnings, msg)
+		res.SwappedServices[name] = true
 	}
 
 	applyServiceOverride(&main, override)

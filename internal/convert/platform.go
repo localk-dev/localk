@@ -41,7 +41,7 @@ func ApplyPlatform(res *Result, mode PlatformMode, hostArch string) {
 	switch mode {
 	case "", PlatformAuto:
 		if hostArch == "arm64" {
-			setPlatformOnAll(res.Compose.Services, "linux/amd64")
+			setPlatformOnAll(res.Compose.Services, "linux/amd64", res.SwappedServices)
 			res.Warnings = append(res.Warnings,
 				"platform pinned to linux/amd64 on every service (host is arm64; most private registries ship amd64-only and would fail with 'no matching manifest'). Pass --platform=native to skip pinning, --platform=<value> to override.",
 			)
@@ -52,7 +52,7 @@ func ApplyPlatform(res *Result, mode PlatformMode, hostArch string) {
 	default:
 		// Literal platform string. We trust the user; Docker will
 		// reject obviously bogus values.
-		setPlatformOnAll(res.Compose.Services, string(mode))
+		setPlatformOnAll(res.Compose.Services, string(mode), res.SwappedServices)
 		res.Warnings = append(res.Warnings, fmt.Sprintf(
 			"platform pinned to %s on every service (--platform=%s).",
 			string(mode), string(mode),
@@ -61,12 +61,17 @@ func ApplyPlatform(res *Result, mode PlatformMode, hostArch string) {
 }
 
 // setPlatformOnAll writes platform onto every service, overwriting
-// any existing value. Services almost never carry a platform field
-// out of the converter — k8s doesn't have an equivalent — but the
-// overwrite is intentional: the user asked for this platform across
-// the stack, so honor that uniformly.
-func setPlatformOnAll(services map[string]compose.Service, platform string) {
+// any existing value — except for services dev-swapped to a known
+// multi-arch upstream image (mongo, rabbitmq, …). Pinning amd64 on
+// those forces Rosetta emulation, which has known socket-syscall
+// bugs (mongo:7's setup mongod fails bind() with EINVAL under
+// emulation). The swap chose a multi-arch image specifically to
+// avoid that path; respect the choice.
+func setPlatformOnAll(services map[string]compose.Service, platform string, skip map[string]bool) {
 	for name, s := range services {
+		if skip[name] {
+			continue
+		}
 		s.Platform = platform
 		services[name] = s
 	}
