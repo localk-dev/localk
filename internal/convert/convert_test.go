@@ -1022,6 +1022,81 @@ func backendOn(name string, port int32) kube.IngressBackend {
 	}
 }
 
+// TestConvert_MemoryUnits verifies the k8s-to-compose memory unit
+// conversion. Compose rejects k8s binary suffixes (Mi, Gi) — this
+// would crash `docker compose up` on any real-world manifest that
+// sets memory limits. Surfaced by Bitnami stateful charts in the
+// user's mp-production namespace; the fix converts everything to
+// plain bytes, which compose accepts losslessly.
+func TestConvert_MemoryUnits(t *testing.T) {
+	cases := []struct {
+		k8sValue       string
+		composeWanted  string
+	}{
+		// Binary (k8s default) — bug-fix targets.
+		{"512Mi", "536870912"},
+		{"2Gi", "2147483648"},
+		{"1Ki", "1024"},
+		// Decimal forms. We translate to bytes for consistency even
+		// though compose accepts m/g directly — one canonical
+		// representation makes the generated YAML easier to diff.
+		{"100M", "100000000"},
+		{"1G", "1000000000"},
+		// Lowercase suffixes (some manifests do this in the wild).
+		{"512mi", "536870912"},
+		{"2gi", "2147483648"},
+		// Edge cases: pass-through where appropriate.
+		{"", ""},
+		{"42", "42"},        // already bytes-as-number
+		{"5xyz", "5xyz"},    // unknown suffix — let compose error
+		{"junk", "junk"},    // no digits — pass through
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.k8sValue, func(t *testing.T) {
+			manifests := &kube.Manifests{
+				Deployments: []kube.Deployment{{
+					Metadata: kube.ObjectMeta{Name: "app"},
+					Spec: kube.DeploymentSpec{
+						Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+						Template: kube.PodTemplate{
+							Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+							Spec: kube.PodSpec{
+								Containers: []kube.Container{{
+									Name:  "app",
+									Image: "example/app",
+									Resources: kube.ResourceReqs{
+										Limits: kube.ResourceList{Memory: tc.k8sValue},
+									},
+								}},
+							},
+						},
+					},
+				}},
+			}
+			result, err := convert.Convert(manifests, nil)
+			if err != nil {
+				t.Fatalf("Convert: %v", err)
+			}
+			svc := result.Compose.Services["app"]
+			if tc.k8sValue == "" {
+				// Empty memory → no Deploy block at all (existing behavior).
+				if svc.Deploy != nil {
+					t.Errorf("empty memory should produce nil Deploy; got %+v", svc.Deploy)
+				}
+				return
+			}
+			if svc.Deploy == nil || svc.Deploy.Resources.Limits == nil {
+				t.Fatalf("expected Deploy.Resources.Limits set for memory %q", tc.k8sValue)
+			}
+			got := svc.Deploy.Resources.Limits.Memory
+			if got != tc.composeWanted {
+				t.Errorf("memory %q normalized to %q, want %q", tc.k8sValue, got, tc.composeWanted)
+			}
+		})
+	}
+}
+
 // TestConvert_StatefulSetSkipOverride verifies localk.yaml overrides apply
 // to StatefulSets the same way they do to Deployments.
 func TestConvert_StatefulSetSkipOverride(t *testing.T) {

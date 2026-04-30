@@ -592,8 +592,66 @@ func normalizeCPU(s string) string {
 	return s
 }
 
-// normalizeMemory passes through a k8s memory quantity since compose accepts
-// most of the same suffixes (M, G, Mi, Gi, etc.).
+// normalizeMemory converts a k8s memory quantity to a compose-compatible
+// integer-bytes string.
+//
+// k8s and compose use different memory unit grammars:
+//   - k8s accepts both binary (Ki, Mi, Gi, Ti — powers of 1024) and decimal
+//     (K, M, G, T — powers of 1000) suffixes.
+//   - compose accepts only decimal suffixes (b, k/kb, m/mb, g/gb) plus plain
+//     bytes as a number. Binary suffixes (Mi/Gi) are rejected with
+//     "invalid suffix" — that's the bug this fixes.
+//
+// We normalize to plain bytes, which compose accepts losslessly. The
+// generated YAML reads "536870912" instead of "512Mi" — less friendly to
+// eyeball but unambiguous and correct on every compose version. Comments
+// in the generated file already point users at `localk generate` rather
+// than hand-editing, so readability of the byte count isn't a real
+// regression.
+//
+// Unknown / unparseable inputs pass through unchanged so a future k8s
+// suffix or a malformed value surfaces as a compose error rather than
+// silently dropping the limit.
 func normalizeMemory(s string) string {
-	return s
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	i := 0
+	for i < len(s) && (s[i] == '.' || (s[i] >= '0' && s[i] <= '9')) {
+		i++
+	}
+	if i == 0 || i == len(s) {
+		// No leading digits, or no suffix to convert — pass through.
+		return s
+	}
+	valStr, suffix := s[:i], s[i:]
+
+	var multiplier int64
+	switch strings.ToLower(suffix) {
+	case "ki":
+		multiplier = 1 << 10
+	case "mi":
+		multiplier = 1 << 20
+	case "gi":
+		multiplier = 1 << 30
+	case "ti":
+		multiplier = 1 << 40
+	case "k":
+		multiplier = 1000
+	case "m":
+		multiplier = 1000 * 1000
+	case "g":
+		multiplier = 1000 * 1000 * 1000
+	case "t":
+		multiplier = 1000 * 1000 * 1000 * 1000
+	default:
+		return s
+	}
+
+	val, err := strconv.ParseFloat(valStr, 64)
+	if err != nil {
+		return s
+	}
+	return strconv.FormatInt(int64(val*float64(multiplier)), 10)
 }
