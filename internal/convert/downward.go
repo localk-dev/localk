@@ -12,9 +12,18 @@ import "strings"
 func resolveFieldRef(fieldPath string, w workload) (string, bool) {
 	switch fieldPath {
 	case "metadata.name":
-		// Single replica locally — the workload name doubles as the
-		// "pod name" for substitution purposes (advertised hostnames,
-		// node names, etc).
+		// k8s pod names are `<sts>-<ordinal>` for StatefulSets and
+		// `<deploy>-<replicaset>-<rand>` for Deployments. Bitnami
+		// charts use MY_POD_NAME to compare against
+		// MONGODB_INITIAL_PRIMARY_HOST etc., which use the StatefulSet
+		// pod-0 form — so for StatefulSets we MUST substitute the
+		// ordinal-zero name (mongodb-0, not mongodb), or the chart
+		// thinks it's a secondary, never accepts writes, and the data
+		// dir-empty bootstrap loop never settles. Compose runs a
+		// single container so ordinal 0 is the correct identity.
+		if w.kindLabel == "statefulset" {
+			return w.name + "-0", true
+		}
 		return w.name, true
 	case "metadata.namespace":
 		// Compose has no namespaces. "default" is the universal fallback

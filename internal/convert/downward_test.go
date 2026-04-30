@@ -3,7 +3,7 @@ package convert
 import "testing"
 
 func TestResolveFieldRef(t *testing.T) {
-	w := workload{name: "mongodb"}
+	w := workload{name: "mongodb", kindLabel: "deployment"}
 	cases := []struct {
 		path string
 		want string
@@ -26,6 +26,20 @@ func TestResolveFieldRef(t *testing.T) {
 				t.Errorf("resolveFieldRef(%q) = (%q, %v), want (%q, %v)", tc.path, got, ok, tc.want, tc.ok)
 			}
 		})
+	}
+}
+
+// TestResolveFieldRef_StatefulSetUsesPodOrdinal covers the Bitnami
+// pattern where MY_POD_NAME is compared against MONGODB_INITIAL_PRIMARY_HOST
+// (set to "<sts>-0.<headless>...") to decide whether this pod is the
+// initial primary. Substituting the bare workload name ("mongodb")
+// instead of the ordinal-zero pod name ("mongodb-0") leaves the chart
+// thinking it's a secondary forever, never bootstrapping the data dir.
+func TestResolveFieldRef_StatefulSetUsesPodOrdinal(t *testing.T) {
+	w := workload{name: "mongodb", kindLabel: "statefulset"}
+	got, ok := resolveFieldRef("metadata.name", w)
+	if !ok || got != "mongodb-0" {
+		t.Errorf("StatefulSet metadata.name should resolve to %q (pod-0 form), got (%q, %v)", "mongodb-0", got, ok)
 	}
 }
 

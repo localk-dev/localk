@@ -851,12 +851,22 @@ func mountStringOrNil(s string) any {
 	return s
 }
 
-// emptyDirHostPath extracts the host-side relative directory of an
-// emptyDir bind-mount entry, or "" for any other entry type. Used
-// by the convertPod loop to record which directories the CLI should
-// `mkdir -p` before docker compose up. Bind mounts on a non-existent
-// host path silently auto-create as 0755 owned by root which then
-// breaks non-root containers — so we explicitly create + chmod 0777.
+// emptyDirHostPath extracts the host-side directory we should pre-create
+// for an emptyDir bind-mount entry. We only pre-create the VOLUME ROOT,
+// not per-subpath leaf dirs:
+//
+//   - Init containers commonly do `cp -r src/ /emptydir/<subpath>` and
+//     rely on the destination NOT existing so cp creates it as a copy
+//     (otherwise cp puts the source as a nested subdir, breaking the
+//     expected layout — Bitnami rabbit's plugins dir hits this exact
+//     case).
+//   - Docker auto-creates a missing bind-mount source as a 0755
+//     root-owned dir, which IS a problem for non-root containers, but
+//     init containers in Bitnami charts always run early enough to
+//     populate the subpath before main mounts it.
+//
+// The volume root we pre-create with mode 0777 so the init can write
+// into it as any UID. Sub-path leaves are left to the init or docker.
 func emptyDirHostPath(entry any) string {
 	s, ok := entry.(string)
 	if !ok {
@@ -870,7 +880,13 @@ func emptyDirHostPath(entry any) string {
 	if colon < 0 {
 		return ""
 	}
-	return strings.TrimPrefix(s[:colon], "./")
+	full := strings.TrimPrefix(s[:colon], "./")
+	// Trim back to the "<workload>/<volume>" volume root.
+	parts := strings.Split(full, "/")
+	if len(parts) < 3 {
+		return ""
+	}
+	return strings.Join(parts[:3], "/")
 }
 
 // materializeConfigMap turns a `volumes: { configMap: { name: X } }`

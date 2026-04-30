@@ -2157,16 +2157,19 @@ func TestConvert_EmptyDir_SubPathSharesVolume(t *testing.T) {
 		}
 	}
 
-	// Each subpath dir + the volume root must be in EmptyDirs so
-	// the CLI mkdirs them with mode 0777 before compose up.
-	for _, sub := range wantSubpaths {
-		want := "volumes/rabbitmq/empty-dir/" + sub
-		if !result.EmptyDirs[want] {
-			t.Errorf("EmptyDirs should record %q for mkdir+chmod, got %v", want, result.EmptyDirs)
-		}
-	}
+	// Only the volume root is recorded — leaf subpath dirs are
+	// deliberately NOT pre-mkdir'd because Bitnami's init containers
+	// do `cp -r src/ /emptydir/<subpath>` and rely on the destination
+	// not existing (otherwise cp nests the source inside the existing
+	// subpath dir).
 	if !result.EmptyDirs["volumes/rabbitmq/empty-dir"] {
-		t.Errorf("EmptyDirs should record the volume root %q (init mounts it whole), got %v", "volumes/rabbitmq/empty-dir", result.EmptyDirs)
+		t.Errorf("EmptyDirs should record the volume root %q, got %v", "volumes/rabbitmq/empty-dir", result.EmptyDirs)
+	}
+	for _, sub := range wantSubpaths {
+		path := "volumes/rabbitmq/empty-dir/" + sub
+		if result.EmptyDirs[path] {
+			t.Errorf("EmptyDirs should NOT pre-mkdir leaf subpath %q (lets init create it correctly)", path)
+		}
 	}
 }
 
