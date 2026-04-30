@@ -371,6 +371,67 @@ func TestApplyDevSwap_SkipsNonClusteredBitnami(t *testing.T) {
 	}
 }
 
+// TestApplyDevSwap_InfluxdbSetupModeGuard covers the influxdata
+// docker image bug where a container restart re-runs `influx setup`
+// against an already-initialized bolt store and crashes on
+// "config name 'default' already exists". The rule keeps the
+// official image (no swap) but wraps the entrypoint with a guard
+// that drops DOCKER_INFLUXDB_INIT_MODE=setup once the bolt file
+// exists, so the second/third/Nth restart runs influxd directly.
+func TestApplyDevSwap_InfluxdbSetupModeGuard(t *testing.T) {
+	main := &compose.Service{
+		Image: "influxdb:2.7.4-alpine",
+		Environment: map[string]string{
+			"DOCKER_INFLUXDB_INIT_MODE":     "setup",
+			"DOCKER_INFLUXDB_INIT_USERNAME": "admin",
+			"DOCKER_INFLUXDB_INIT_BUCKET":   "default",
+		},
+		// Original chart had no command — we expect the wrapper to
+		// fill it in.
+	}
+	msg := applyDevSwap("influxdb-influxdb2", main, nil, false, nil, nil, nil)
+	if msg == "" {
+		t.Fatalf("expected dev-swap to fire on influxdb in setup mode")
+	}
+	// Image must NOT change — this rule is a command wrapper, not
+	// a chart-image swap.
+	if main.Image != "influxdb:2.7.4-alpine" {
+		t.Errorf("influxdb image should be kept, got %q", main.Image)
+	}
+	// Entrypoint + Command must be set so the guard runs ahead of
+	// the official entrypoint.
+	if len(main.Entrypoint) == 0 || main.Entrypoint[0] != "sh" {
+		t.Errorf("Entrypoint should be `sh -c <wrapper>`, got %v", main.Entrypoint)
+	}
+	if len(main.Command) != 1 || !strings.Contains(main.Command[0], "DOCKER_INFLUXDB_INIT_MODE") {
+		t.Errorf("Command should embed the setup-mode guard, got %v", main.Command)
+	}
+	// Original env survives — the wrapper unsets MODE only inside
+	// its own exec when the database is already initialized; the
+	// container env still needs MODE=setup for the FIRST start.
+	if main.Environment["DOCKER_INFLUXDB_INIT_MODE"] != "setup" {
+		t.Errorf("DOCKER_INFLUXDB_INIT_MODE should remain in env for first-start setup, got %q", main.Environment["DOCKER_INFLUXDB_INIT_MODE"])
+	}
+}
+
+// TestApplyDevSwap_InfluxdbWithoutSetupModeUntouched confirms the
+// guard only fires when setup mode is actually configured. Plain
+// influxdb deployments (no auto-bootstrap) shouldn't grow a
+// wrapper they don't need.
+func TestApplyDevSwap_InfluxdbWithoutSetupModeUntouched(t *testing.T) {
+	main := &compose.Service{
+		Image:       "influxdb:2.7.4-alpine",
+		Environment: map[string]string{},
+	}
+	msg := applyDevSwap("influxdb", main, nil, false, nil, nil, nil)
+	if msg != "" {
+		t.Errorf("plain influxdb (no setup mode) should not trigger guard, got %q", msg)
+	}
+	if len(main.Entrypoint) != 0 || len(main.Command) != 0 {
+		t.Errorf("Entrypoint/Command should be untouched, got Entrypoint=%v Command=%v", main.Entrypoint, main.Command)
+	}
+}
+
 // TestApplyDevSwap_LeavesUnknownImages confirms the rule list is
 // closed — random non-chart images aren't accidentally swapped.
 func TestApplyDevSwap_LeavesUnknownImages(t *testing.T) {

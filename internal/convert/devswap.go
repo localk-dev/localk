@@ -162,6 +162,20 @@ func (l envLookup) addToEnvFile(name, value string) {
 	*l.envFileLines = append(*l.envFileLines, fmt.Sprintf(`%s="%s"`, name, escaped))
 }
 
+// influxdbSetupGuardCommand wraps influxdb:2.x's entrypoint with a
+// guard that drops DOCKER_INFLUXDB_INIT_MODE=setup once the bolt
+// file exists. Without this, a container restart re-runs `influx
+// setup` against an already-initialized database and crashes on
+// `influx config create --config-name default ... already exists`
+// — a long-standing bug in influxdata's official docker entrypoint
+// (see influxdata-docker#506). The check is idempotent and
+// invisible on first start (bolt absent → setup runs normally).
+const influxdbSetupGuardCommand = `if [ -s /var/lib/influxdb2/influxd.bolt ] && [ "$DOCKER_INFLUXDB_INIT_MODE" = "setup" ]; then
+  echo "[localk] influxdb already initialized; skipping setup mode for this restart"
+  unset DOCKER_INFLUXDB_INIT_MODE
+fi
+exec /entrypoint.sh influxd`
+
 var devSwapRules = []devSwapRule{
 	{
 		name: "Bitnami MongoDB clustered chart → mongo:7 standalone",
@@ -185,6 +199,24 @@ var devSwapRules = []devSwapRule{
 		},
 		devImage:         "mongo:7",
 		transformService: standaloneMongo,
+	},
+	{
+		name: "InfluxDB 2.x setup-mode restart guard",
+		matchImage: func(img string) bool {
+			// Official influxdata image; covers tagged variants
+			// like influxdb:2.7-alpine, influxdb:2.7.4, etc.
+			return imageMatches(img, "influxdb", "library/influxdb")
+		},
+		matchEnv: func(l envLookup) bool {
+			// Only fire when the chart actually configured
+			// auto-setup; otherwise the entrypoint runs influxd
+			// directly and there's nothing to guard.
+			v, _ := l.get("DOCKER_INFLUXDB_INIT_MODE")
+			return v == "setup"
+		},
+		// Same image — we only adjust the command.
+		devImage:         "",
+		transformService: guardInfluxdbSetup,
 	},
 	{
 		name: "Bitnami RabbitMQ clustered chart → rabbitmq:3-management standalone",
@@ -249,30 +281,45 @@ func applyDevSwap(
 			continue
 		}
 		original := main.Image
-		main.Image = rule.devImage
+		swappedImage := rule.devImage != "" && rule.devImage != main.Image
+		if rule.devImage != "" {
+			main.Image = rule.devImage
+		}
 		if rule.transformService != nil {
 			rule.transformService(main, lookup)
 		}
-		// The k8s-FQDN hostname we set for cluster-mode workloads
-		// (mongodb.mongodb-headless.default.svc.cluster.local etc.)
-		// exists to make Erlang's USE_LONGNAME binding work for
-		// rabbit and similar. Vanilla images don't need it, and
-		// some (mongo:7's first-stage setup mongod) reject it
-		// outright with "setup bind: Invalid argument" — clear it
-		// and let docker assign the default short container hostname.
-		// Network aliases still cover external lookups.
-		main.Hostname = ""
-		// Clear the linux/amd64 platform pin we auto-set for the
-		// chart's image. Vanilla mongo / rabbitmq images are
-		// multi-arch with native arm64 builds, so emulating amd64
-		// under Rosetta is both slow and bug-prone — Rosetta has
-		// known issues where bind() returns EINVAL for some socket
-		// setups. Letting docker pick the host arch fixes both.
-		main.Platform = ""
-		dropInitContainers(svcName, main, extras)
+		// The clean-up below only applies to image swaps. Rules
+		// that leave the image alone (entrypoint guards like the
+		// influxdb setup-mode wrapper) want to keep the chart's
+		// own hostname / platform / inits intact.
+		if swappedImage {
+			// The k8s-FQDN hostname we set for cluster-mode
+			// workloads (mongodb.mongodb-headless.default.svc.cluster.local
+			// etc.) exists to make Erlang's USE_LONGNAME binding
+			// work for rabbit and similar. Vanilla images don't
+			// need it, and some (mongo:7's first-stage setup
+			// mongod) reject it outright with "setup bind: Invalid
+			// argument" — clear it and let docker assign the
+			// default short container hostname. Network aliases
+			// still cover external lookups.
+			main.Hostname = ""
+			// Clear the linux/amd64 platform pin we auto-set for
+			// the chart's image. Vanilla mongo / rabbitmq images
+			// are multi-arch with native arm64 builds, so
+			// emulating amd64 under Rosetta is both slow and
+			// bug-prone — Rosetta has known issues where bind()
+			// returns EINVAL for some socket setups. Letting
+			// docker pick the host arch fixes both.
+			main.Platform = ""
+			dropInitContainers(svcName, main, extras)
+			return fmt.Sprintf(
+				"%s detected on workload %q: replaced image %q with %q for local dev. The chart's clustered bootstrap doesn't translate to compose; the dev image runs as a single standalone node speaking the same wire protocol. Set services.%s.preserve_image: true in localk.yaml to keep the chart image.",
+				rule.name, svcName, original, rule.devImage, svcName,
+			)
+		}
 		return fmt.Sprintf(
-			"%s detected on workload %q: replaced image %q with %q for local dev. The chart's clustered bootstrap doesn't translate to compose; the dev image runs as a single standalone node speaking the same wire protocol. Set services.%s.preserve_image: true in localk.yaml to keep the chart image.",
-			rule.name, svcName, original, rule.devImage, svcName,
+			"%s applied on workload %q (image %q kept). Set services.%s.preserve_image: true in localk.yaml to skip this transform.",
+			rule.name, svcName, original, svcName,
 		)
 	}
 	return ""
@@ -405,6 +452,24 @@ func standaloneRabbit(svc *compose.Service, lookup envLookup) {
 	)
 	svc.Command = nil
 	svc.Entrypoint = nil
+}
+
+// guardInfluxdbSetup wraps the influxdb container's command so the
+// setup-mode bootstrap is skipped on subsequent restarts. Without
+// the guard the entrypoint re-runs `influx config create
+// --config-name default` against an already-initialized bolt store
+// and exits with "config name 'default' already exists" — a
+// long-standing bug in influxdata's own docker image (see
+// influxdata-docker#506).
+//
+// The wrapper is shell-only and idempotent: first start sees no
+// bolt file → setup runs as normal; later starts see a non-empty
+// bolt → DOCKER_INFLUXDB_INIT_MODE is unset for that exec only,
+// the entrypoint runs influxd directly, and the database comes
+// back up cleanly.
+func guardInfluxdbSetup(svc *compose.Service, _ envLookup) {
+	svc.Entrypoint = []string{"sh", "-c"}
+	svc.Command = []string{influxdbSetupGuardCommand}
 }
 
 // stripPrefixes deletes any env keys that start with one of the
