@@ -1542,6 +1542,161 @@ func TestConvert_ConfigMapVolumeMissingWarns(t *testing.T) {
 	}
 }
 
+// TestConvert_ConfigMapVolumeMount_SubPath covers Bitnami's pattern
+// of mounting a single key from a ConfigMap as a file (e.g.
+// /scripts/setup.sh) via subPath. Without honouring subPath, the
+// whole CM dir gets bind-mounted at the file path, Docker creates
+// a directory at /scripts/setup.sh, and the container fails with
+// "exec: ... is a directory: permission denied".
+func TestConvert_ConfigMapVolumeMount_SubPath(t *testing.T) {
+	manifests := &kube.Manifests{
+		ConfigMaps: []kube.ConfigMap{{
+			Metadata: kube.ObjectMeta{Name: "scripts"},
+			Data: map[string]string{
+				"setup.sh":   "#!/bin/bash\necho hi\n",
+				"helper.sh":  "echo helper\n",
+				"unrelated":  "noise\n",
+			},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{
+							{Name: "scripts", ConfigMap: &kube.ConfigMapVol{Name: "scripts"}},
+						},
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "example/app",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "scripts", MountPath: "/scripts/setup.sh", SubPath: "setup.sh"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	got := result.Compose.Services["app"].Volumes
+	want := "./configs/scripts/setup.sh:/scripts/setup.sh:ro"
+	found := false
+	for _, v := range got {
+		if v == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected subPath mount %q, got %v", want, got)
+	}
+	if _, ok := result.ConfigFiles["configs/scripts/setup.sh"]; !ok {
+		t.Errorf("setup.sh content should still be materialized, got files=%v", mapKeys(result.ConfigFiles))
+	}
+}
+
+// TestConvert_ConfigMapVolumeMount_SubPathMissingKeyWarns guards
+// against silent typos: if the manifest references a subPath that
+// doesn't match any ConfigMap key, the user gets a warning rather
+// than a mystery missing-file at runtime.
+func TestConvert_ConfigMapVolumeMount_SubPathMissingKeyWarns(t *testing.T) {
+	manifests := &kube.Manifests{
+		ConfigMaps: []kube.ConfigMap{{
+			Metadata: kube.ObjectMeta{Name: "scripts"},
+			Data:     map[string]string{"setup.sh": "ok"},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{
+							{Name: "scripts", ConfigMap: &kube.ConfigMapVol{Name: "scripts"}},
+						},
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "example/app",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "scripts", MountPath: "/scripts/missing.sh", SubPath: "missing.sh"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	matched := false
+	for _, w := range result.Warnings {
+		if strings.Contains(w, `subPath "missing.sh"`) && strings.Contains(w, "not in the ConfigMap") {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		t.Errorf("expected a warning about missing subPath key; got warnings=%v", result.Warnings)
+	}
+}
+
+// TestConvert_SecretVolumeMount_SubPath is the Secret-side sibling.
+// Real-world example: a Secret with multiple cert files where the
+// container only wants /etc/ssl/private.pem mounted as the single
+// private-key file.
+func TestConvert_SecretVolumeMount_SubPath(t *testing.T) {
+	manifests := &kube.Manifests{
+		Secrets: []kube.Secret{{
+			Metadata:   kube.ObjectMeta{Name: "tls"},
+			StringData: map[string]string{"private.pem": "-----BEGIN-----"},
+		}},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "app"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "app"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "app"}},
+					Spec: kube.PodSpec{
+						Volumes: []kube.Volume{
+							{Name: "tls", Secret: &kube.SecretVol{SecretName: "tls"}},
+						},
+						Containers: []kube.Container{{
+							Name:  "app",
+							Image: "example/app",
+							VolumeMounts: []kube.VolumeMount{
+								{Name: "tls", MountPath: "/etc/ssl/private.pem", SubPath: "private.pem"},
+							},
+						}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	got := result.Compose.Services["app"].Volumes
+	want := "./secrets/tls/private.pem:/etc/ssl/private.pem:ro"
+	found := false
+	for _, v := range got {
+		if v == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected secret subPath mount %q, got %v", want, got)
+	}
+}
+
 func mapKeys(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

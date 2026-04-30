@@ -6,6 +6,7 @@ package convert
 import (
 	"encoding/base64"
 	"fmt"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -616,7 +617,11 @@ func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, decision shareDecision,
 		}
 		return vm.MountPath, "", false, nil, nil
 	case v.HostPath != nil:
-		return fmt.Sprintf("%s:%s", v.HostPath.Path, vm.MountPath), "", false, nil, nil
+		src := v.HostPath.Path
+		if vm.SubPath != "" {
+			src = path.Join(src, vm.SubPath)
+		}
+		return fmt.Sprintf("%s:%s", src, vm.MountPath), "", false, nil, nil
 	case v.ConfigMap != nil:
 		return materializeConfigMap(v.ConfigMap.Name, vm, m)
 	case v.Secret != nil:
@@ -646,6 +651,21 @@ func materializeConfigMap(name string, vm kube.VolumeMount, m *kube.Manifests) (
 	for key, val := range cm.Data {
 		files[fmt.Sprintf("configs/%s/%s", name, key)] = val
 	}
+	// k8s subPath mounts a single key from the ConfigMap as a file at
+	// the mount path (e.g. /scripts/setup.sh) instead of the whole CM
+	// directory. Without this, Docker bind-mounts the entire dir and
+	// the container sees a directory where it expects a file —
+	// "exec: /scripts/setup.sh: is a directory" or similar.
+	if vm.SubPath != "" {
+		if _, ok := cm.Data[vm.SubPath]; !ok {
+			return "", "", false, files, []string{fmt.Sprintf(
+				"volumeMount %q on ConfigMap %q has subPath %q but that key is not in the ConfigMap data",
+				vm.Name, name, vm.SubPath,
+			)}
+		}
+		mount := fmt.Sprintf("./configs/%s/%s:%s:ro", name, vm.SubPath, vm.MountPath)
+		return mount, "", false, files, nil
+	}
 	mount := fmt.Sprintf("./configs/%s:%s:ro", name, vm.MountPath)
 	return mount, "", false, files, nil
 }
@@ -668,11 +688,24 @@ func materializeSecret(name string, vm kube.VolumeMount, m *kube.Manifests) (str
 	for key, val := range values {
 		files[fmt.Sprintf("secrets/%s/%s", name, key)] = val
 	}
-	mount := fmt.Sprintf("./secrets/%s:%s:ro", name, vm.MountPath)
 	warning := fmt.Sprintf(
 		"Secret %q materialized as files under secrets/%s/. These are real cluster secret values — add `secrets/` to .gitignore and never commit them.",
 		name, name,
 	)
+	// subPath mounts a single secret key as a file (e.g. an RSA
+	// private key at /etc/keys/private.pem) instead of the whole
+	// Secret directory.
+	if vm.SubPath != "" {
+		if _, ok := values[vm.SubPath]; !ok {
+			return "", "", false, files, []string{fmt.Sprintf(
+				"volumeMount %q on Secret %q has subPath %q but that key is not in the Secret data",
+				vm.Name, name, vm.SubPath,
+			)}
+		}
+		mount := fmt.Sprintf("./secrets/%s/%s:%s:ro", name, vm.SubPath, vm.MountPath)
+		return mount, "", false, files, []string{warning}
+	}
+	mount := fmt.Sprintf("./secrets/%s:%s:ro", name, vm.MountPath)
 	return mount, "", false, files, []string{warning}
 }
 

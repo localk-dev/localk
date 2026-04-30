@@ -516,8 +516,8 @@ docker-compose constructs:
 | `Deployment`            | `service` (image, env, command, volumes)            |
 | `StatefulSet`           | `service` with named volume per `volumeClaimTemplate` |
 | `Service`               | service hostname + port mapping                     |
-| `ConfigMap`             | `environment` entries (env-source) or files materialized under `configs/<name>/` and bind-mounted (volume-source) |
-| `Secret`                | `.env` entries (env-source) or files materialized under `secrets/<name>/` and bind-mounted (volume-source)        |
+| `ConfigMap`             | `environment` entries (env-source) or files materialized under `configs/<name>/` and bind-mounted (volume-source; honours `subPath` to mount a single key as a file) |
+| `Secret`                | `.env` entries (env-source) or files materialized under `secrets/<name>/` and bind-mounted (volume-source; honours `subPath` to mount a single key as a file)        |
 | `PersistentVolumeClaim` | named `volume`                                      |
 | `Ingress`               | `caddy` reverse proxy + generated `Caddyfile`       |
 
