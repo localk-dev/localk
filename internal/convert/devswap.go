@@ -262,6 +262,13 @@ func applyDevSwap(
 		// and let docker assign the default short container hostname.
 		// Network aliases still cover external lookups.
 		main.Hostname = ""
+		// Clear the linux/amd64 platform pin we auto-set for the
+		// chart's image. Vanilla mongo / rabbitmq images are
+		// multi-arch with native arm64 builds, so emulating amd64
+		// under Rosetta is both slow and bug-prone — Rosetta has
+		// known issues where bind() returns EINVAL for some socket
+		// setups. Letting docker pick the host arch fixes both.
+		main.Platform = ""
 		dropInitContainers(svcName, main, extras)
 		return fmt.Sprintf(
 			"%s detected on workload %q: replaced image %q with %q for local dev. The chart's clustered bootstrap doesn't translate to compose; the dev image runs as a single standalone node speaking the same wire protocol. Set services.%s.preserve_image: true in localk.yaml to keep the chart image.",
@@ -347,12 +354,18 @@ func standaloneMongo(svc *compose.Service, lookup envLookup) {
 		lookup.addToEnvFile("MONGO_INITDB_ROOT_PASSWORD", pass)
 	}
 	stripPrefixes(svc.Environment, "MONGODB_", "MY_POD_", "K8S_", "BITNAMI_")
-	// /bitnami is Bitnami's umbrella prefix for everything chart-
-	// specific (configs, scripts, helpers); /opt/bitnami/mongodb is
-	// the runtime layout the chart wires up. Drop both — vanilla
-	// mongo doesn't use them and the bind sources won't exist after
-	// the swap anyway.
-	svc.Volumes = filterChartVolumes(svc.Volumes, "/bitnami", "/opt/bitnami/mongodb")
+	// Drop every chart-specific mount: /bitnami umbrella, the
+	// /opt/bitnami runtime layout, plus the scratch dirs Bitnami
+	// uses (/tmp bind, /.mongodb bind, setup-script bind). Vanilla
+	// mongo doesn't read any of these and the host bind sources
+	// (under volumes/) get re-created on first start anyway. The
+	// PVC datadir survives because PVCs become named-volume mounts
+	// (e.g. "mongodb-datadir:/data/db") which don't match these
+	// bind-path prefixes.
+	svc.Volumes = filterChartVolumes(svc.Volumes,
+		"/bitnami", "/opt/bitnami/mongodb",
+		"/tmp", "/.mongodb", "/scripts",
+	)
 	svc.Command = nil
 	svc.Entrypoint = nil
 }
@@ -386,7 +399,13 @@ func standaloneRabbit(svc *compose.Service, lookup envLookup) {
 		}
 	}
 	stripPrefixes(svc.Environment, "MY_POD_", "K8S_", "BITNAMI_")
-	svc.Volumes = filterChartVolumes(svc.Volumes, "/bitnami", "/opt/bitnami/rabbitmq")
+	// Drop chart-specific binds (matching standaloneMongo's logic).
+	// Vanilla rabbitmq:3-management has its own /tmp, /etc, plugin
+	// dirs baked into the image; let it use them.
+	svc.Volumes = filterChartVolumes(svc.Volumes,
+		"/bitnami", "/opt/bitnami/rabbitmq",
+		"/tmp", "/scripts",
+	)
 	svc.Command = nil
 	svc.Entrypoint = nil
 }

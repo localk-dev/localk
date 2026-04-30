@@ -200,6 +200,71 @@ func TestApplyDevSwap_TranslatesSecretSourcedAuth(t *testing.T) {
 	}
 }
 
+// TestApplyDevSwap_ClearsPlatformPin documents why we drop the
+// auto-set linux/amd64 platform on the swapped service: vanilla
+// images are multi-arch (mongo:7 / rabbitmq:3-management both ship
+// arm64 builds), and running them under Rosetta on Apple Silicon
+// triggers a known kernel-translation bug where bind() returns
+// EINVAL during mongo:7's first-stage setup. Letting docker pick
+// the host arch sidesteps it entirely.
+func TestApplyDevSwap_ClearsPlatformPin(t *testing.T) {
+	main := &compose.Service{
+		Image:    "docker.io/bitnami/mongodb:7.0",
+		Platform: "linux/amd64",
+		Environment: map[string]string{
+			"MONGODB_REPLICA_SET_MODE": "primary",
+		},
+	}
+	msg := applyDevSwap("mongodb-headless", main, nil, false, nil, nil, nil)
+	if msg == "" {
+		t.Fatalf("expected dev-swap warning")
+	}
+	if main.Platform != "" {
+		t.Errorf("Platform pin should be cleared after swap, got %q", main.Platform)
+	}
+}
+
+// TestApplyDevSwap_DropsChartScratchMounts confirms the swap
+// strips the chart-specific scratch bind mounts (/tmp, /.mongodb,
+// /scripts/...) along with the /bitnami umbrella ones. Vanilla
+// images set up these paths internally; the leftover binds point
+// at host dirs that exist only because the chart needed them and
+// aren't useful to the upstream image.
+func TestApplyDevSwap_DropsChartScratchMounts(t *testing.T) {
+	main := &compose.Service{
+		Image: "bitnami/mongodb:7.0",
+		Environment: map[string]string{
+			"MONGODB_REPLICA_SET_MODE": "primary",
+		},
+		Volumes: []any{
+			"./volumes/mongodb/empty-dir/tmp-dir:/tmp",
+			"./volumes/mongodb/empty-dir/mongosh-home:/.mongodb",
+			"./configs/mongodb-scripts/setup.sh:/scripts/setup.sh:ro",
+			"mongodb-datadir:/data/db",
+		},
+	}
+	if msg := applyDevSwap("mongodb-headless", main, nil, false, nil, nil, nil); msg == "" {
+		t.Fatalf("expected dev-swap warning")
+	}
+	for _, v := range main.Volumes {
+		s, _ := v.(string)
+		for _, drop := range []string{":/tmp", ":/.mongodb", ":/scripts"} {
+			if strings.Contains(s, drop) {
+				t.Errorf("chart scratch mount should be dropped, kept: %q", s)
+			}
+		}
+	}
+	hasDatadir := false
+	for _, v := range main.Volumes {
+		if s, _ := v.(string); s == "mongodb-datadir:/data/db" {
+			hasDatadir = true
+		}
+	}
+	if !hasDatadir {
+		t.Errorf("PVC datadir at /data/db should survive the chart-scratch sweep, got %v", main.Volumes)
+	}
+}
+
 // TestApplyDevSwap_ClearsClusterFQDNHostname covers a real failure
 // in mp-production: with hostname set to the cluster FQDN
 // (`mongodb.mongodb-headless.default.svc.cluster.local`, added for
