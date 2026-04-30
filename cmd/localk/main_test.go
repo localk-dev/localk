@@ -184,9 +184,11 @@ func TestMaterializedFileMode(t *testing.T) {
 		// and the container fails with "exec: permission denied".
 		{"configs/mongodb-scripts/setup.sh", 0o755},
 		{"configs/nats-config/nats.conf", 0o755},
-		// Secrets stay restrictive: code reads them, never execs.
-		{"secrets/tls/private.pem", 0o600},
-		{"secrets/api/api-key", 0o600},
+		// Secrets match k8s' default projected mode (0644) — 0600
+		// would block non-root containers (Bitnami runs UID 1001)
+		// from reading their own secret files.
+		{"secrets/tls/private.pem", 0o644},
+		{"secrets/api/api-key", 0o644},
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {

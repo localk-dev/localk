@@ -476,11 +476,16 @@ func writeFileMode(path string, data []byte, mode os.FileMode) error {
 // file. ConfigMap-derived files default to 0755 because helm charts
 // (Bitnami especially) commonly mount a single key as an executable
 // script via subPath; without +x the container fails with "exec ...:
-// permission denied". Secret files stay at 0600 since they hold
-// sensitive cluster data and apps read them rather than exec them.
+// permission denied". Secret files use 0644 to match k8s' default
+// projected-secret mode — containers commonly run as a non-root
+// user (rabbitmq is UID 1001) and the host UID writing these files
+// is different, so 0600 leaves the in-container reader unable to
+// open them. The data is already on the developer's disk under
+// secrets/; the marginal protection of 0600 isn't worth breaking
+// every Bitnami chart that reads its own secret files.
 func materializedFileMode(relPath string) os.FileMode {
 	if strings.HasPrefix(relPath, "secrets/") {
-		return 0o600
+		return 0o644
 	}
 	return 0o755
 }
