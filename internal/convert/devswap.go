@@ -199,6 +199,17 @@ fi
 if [ "$$DOCKER_INFLUXDB_INIT_MODE" = "setup" ]; then
   echo "[localk] clearing stale CLI configs in /etc/influxdb2/ before setup"
   rm -f /etc/influxdb2/influx-configs 2>/dev/null || true
+  # The official entrypoint runs an influx bucket list after setup
+  # using INFLUX_ORG from env (your apps org name) to look up the
+  # bucket it just created. If DOCKER_INFLUXDB_INIT_ORG (the org
+  # setup creates) does not match INFLUX_ORG, the post-setup lookup
+  # 404s with organization-not-found and the wrapper crash-loops.
+  # Align them by overriding INIT_ORG with INFLUX_ORG — so setup
+  # creates the org the apps will use.
+  if [ -n "$$INFLUX_ORG" ] && [ "$$DOCKER_INFLUXDB_INIT_ORG" != "$$INFLUX_ORG" ]; then
+    echo "[localk] aligning DOCKER_INFLUXDB_INIT_ORG ($$DOCKER_INFLUXDB_INIT_ORG) with INFLUX_ORG ($$INFLUX_ORG) so post-setup bucket lookup finds the right org"
+    export DOCKER_INFLUXDB_INIT_ORG="$$INFLUX_ORG"
+  fi
 fi
 exec /entrypoint.sh influxd`
 
