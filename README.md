@@ -147,6 +147,27 @@ localk down -- --timeout 5
 regenerate the compose file — that's always `localk generate`'s job — so a
 failure points clearly at one side or the other.
 
+### Local edits survive a regen
+
+Real local debugging routinely needs ad-hoc tweaks: wrap an RSA key in
+PEM headers, swap a hostname, change a port. By default `localk generate`
+**preserves** existing values when re-run:
+
+- `.env` — existing `KEY=value` lines are kept verbatim. New keys from
+  upstream Secrets are appended under a marker comment.
+- `configs/<name>/*` and `secrets/<name>/*` — files that already exist
+  on disk are left alone. New files still get materialized.
+
+If you actually want a clean rewrite (e.g. you suspect a stale value),
+pass `--overwrite`:
+
+```bash
+localk generate ./k8s --overwrite
+```
+
+`docker-compose.yml` itself is always regenerated; it's the canonical
+output and is meant to be a derived artifact.
+
 ## Interactive shell (`localk tui`)
 
 For configuring a 60-service stack, typing service names by hand gets old

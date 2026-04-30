@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,8 +23,8 @@ import (
 const usage = `localk - run your Kubernetes stack locally with one command.
 
 Usage:
-  localk generate <input-dir> [--out-dir <dir>] [-o <file>] [--config <file>] [--dry-run]
-  localk generate -k [-n <namespace>] [--context <name>] [-y] [--out-dir <dir>] [--config <file>] [--dry-run]
+  localk generate <input-dir> [--out-dir <dir>] [-o <file>] [--config <file>] [--dry-run] [--overwrite]
+  localk generate -k [-n <namespace>] [--context <name>] [-y] [--out-dir <dir>] [--config <file>] [--dry-run] [--overwrite]
   localk up   [--out-dir <dir>] [-f <file>] [--build] [--no-detach] [--disable <list>] [-- DOCKER_COMPOSE_ARGS...]
   localk down [--out-dir <dir>] [-f <file>] [-v] [-- DOCKER_COMPOSE_ARGS...]
   localk dev  <service> --port <host-port> [--out-dir <dir>] [--container-port <n>]
@@ -125,6 +127,7 @@ func runGenerate(args []string) {
 	memoryMode := fs.String("memory", "auto", "memory limit policy: auto (scale to fit Docker memory), preserve (declared k8s values), drop (no limits)")
 	cpuMode := fs.String("cpu", "auto", "CPU limit policy: auto (scale to fit Docker CPU count), preserve (declared k8s values), drop (no limits)")
 	platformMode := fs.String("platform", "auto", "platform pinning policy: auto (set linux/amd64 on arm64 hosts), native (no pinning), or a literal value like linux/amd64")
+	overwrite := fs.Bool("overwrite", false, "overwrite .env, configs/*, and secrets/* even if locally edited (default: preserve existing values, only append new ones)")
 
 	args = reorderFlagsFirst(args)
 	if err := fs.Parse(args); err != nil {
@@ -231,11 +234,17 @@ func runGenerate(args []string) {
 	if err := writeFile(composePath, composeOut); err != nil {
 		fail("writing %s: %v", composePath, err)
 	}
+	envSummary := ""
 	if envContents != "" {
 		if err := ensureParentDir(envPath); err != nil {
 			fail("preparing output directory for %s: %v", envPath, err)
 		}
-		if err := writeFile(envPath, []byte(envContents)); err != nil {
+		merged, summary, err := mergeEnvFile(envPath, envContents, *overwrite)
+		if err != nil {
+			fail("merging %s: %v", envPath, err)
+		}
+		envSummary = summary
+		if err := writeFile(envPath, []byte(merged)); err != nil {
 			fail("writing %s: %v", envPath, err)
 		}
 	}
@@ -259,30 +268,50 @@ func runGenerate(args []string) {
 	// so without +x we'd see "exec ...: permission denied". Secrets
 	// stay at 0600 since they're sensitive cluster data and code
 	// reads them, never execs them.
+	configFilesWritten, configFilesPreserved := 0, 0
 	for relPath, content := range result.ConfigFiles {
 		fullPath := filepath.Join(*outDir, relPath)
 		if err := ensureParentDir(fullPath); err != nil {
 			fail("preparing directory for %s: %v", fullPath, err)
 		}
+		// Preserve existing files by default — local edits to a
+		// materialized config or secret survive a regen. Pass
+		// --overwrite for a clean rewrite.
+		if !*overwrite {
+			if _, err := os.Stat(fullPath); err == nil {
+				configFilesPreserved++
+				continue
+			}
+		}
 		mode := materializedFileMode(relPath)
 		if err := writeFileMode(fullPath, []byte(content), mode); err != nil {
 			fail("writing %s: %v", fullPath, err)
 		}
+		configFilesWritten++
 	}
 
 	abs, _ := filepath.Abs(composePath)
 	fmt.Printf("Wrote %s (%d services)\n", abs, len(result.Compose.Services))
 	if envContents != "" {
 		envAbs, _ := filepath.Abs(envPath)
-		fmt.Printf("Wrote %s with secret-derived env vars. Review before sharing.\n", envAbs)
+		fmt.Printf("Wrote %s with secret-derived env vars. %s\n", envAbs, envSummary)
 	}
 	if result.CaddyFile != "" {
 		caddyAbs, _ := filepath.Abs(caddyPath)
 		fmt.Printf("Wrote %s for the Caddy reverse proxy.\n", caddyAbs)
 	}
 	if len(result.ConfigFiles) > 0 {
-		fmt.Printf("Wrote %d config/secret file(s) under %s/{configs,secrets}/.\n",
-			len(result.ConfigFiles), *outDir)
+		switch {
+		case configFilesPreserved == 0:
+			fmt.Printf("Wrote %d config/secret file(s) under %s/{configs,secrets}/.\n",
+				configFilesWritten, *outDir)
+		case configFilesWritten == 0:
+			fmt.Printf("Preserved %d existing config/secret file(s) under %s/{configs,secrets}/ (pass --overwrite to refresh).\n",
+				configFilesPreserved, *outDir)
+		default:
+			fmt.Printf("Wrote %d new and preserved %d existing config/secret file(s) under %s/{configs,secrets}/ (pass --overwrite to refresh).\n",
+				configFilesWritten, configFilesPreserved, *outDir)
+		}
 	}
 
 	for _, w := range result.Warnings {
@@ -466,6 +495,89 @@ func displayContext(c string) string {
 
 func writeFile(path string, data []byte) error {
 	return os.WriteFile(path, data, 0o644)
+}
+
+// mergeEnvFile produces the new contents to write to .env, given
+// the freshly-generated secret-derived contents and an existing
+// file on disk. The intent is "your local edits survive a regen":
+//
+//   - When `path` doesn't exist (or overwrite=true), the generated
+//     contents win wholesale.
+//   - Otherwise, the existing file is kept as-is and only KEY=VALUE
+//     lines for keys NOT already present in it are appended at the
+//     end (under a small marker section). New Secrets you add
+//     upstream still flow through; tweaks to existing values stay.
+//
+// The returned summary is a single human-readable sentence for the
+// CLI's success line (e.g. "Preserved 12, added 3 new keys.").
+//
+// Only simple `KEY=value` and `KEY="value"` forms are recognized.
+// That matches what we emit and what compose v2 reads from .env;
+// fancier shell-quoting tricks on the user's side are left alone.
+func mergeEnvFile(path, generated string, overwrite bool) (string, string, error) {
+	header := "# Generated by localk. Do not edit by hand — regenerate from your k8s manifests instead.\n"
+	if overwrite {
+		return generated, "Overwritten.", nil
+	}
+	existing, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return generated, "Wrote secret-derived env vars. Review before sharing.", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	have := envKeys(string(existing))
+	var appended []string
+	for _, line := range strings.Split(generated, "\n") {
+		key := envLineKey(line)
+		if key == "" {
+			continue
+		}
+		if have[key] {
+			continue
+		}
+		appended = append(appended, line)
+		have[key] = true
+	}
+	if len(appended) == 0 {
+		return string(existing), fmt.Sprintf("Preserved %d existing key(s); no new keys to add.", len(have)), nil
+	}
+	out := strings.TrimRight(string(existing), "\n") + "\n\n" +
+		"# Appended by localk on regen — new keys from upstream Secrets.\n" +
+		strings.Join(appended, "\n") + "\n"
+	// If the existing file is a fresh placeholder (just the header,
+	// no keys), prefer the cleaner generated form over a stub-plus-append.
+	if len(have) == len(appended) && strings.HasPrefix(string(existing), header) {
+		return generated, "Wrote secret-derived env vars. Review before sharing.", nil
+	}
+	return out, fmt.Sprintf("Preserved %d existing key(s); appended %d new.", len(have)-len(appended), len(appended)), nil
+}
+
+// envKeys returns the set of KEY names present in an .env-style
+// document. Comment and blank lines are ignored. KEY=value and
+// KEY="value" are both recognized.
+func envKeys(content string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(content, "\n") {
+		if k := envLineKey(line); k != "" {
+			out[k] = true
+		}
+	}
+	return out
+}
+
+// envLineKey extracts the KEY from a `KEY=value` or `KEY="value"`
+// line, returning "" for comments and blank lines.
+func envLineKey(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return ""
+	}
+	eq := strings.IndexByte(trimmed, '=')
+	if eq <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(trimmed[:eq])
 }
 
 func writeFileMode(path string, data []byte, mode os.FileMode) error {
