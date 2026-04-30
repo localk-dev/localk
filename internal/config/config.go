@@ -35,6 +35,14 @@ type ServiceOverride struct {
 	// Accepts either a string shorthand ("./services/api") or an object
 	// with explicit context + dockerfile.
 	Build *BuildOverride `yaml:"build,omitempty"`
+
+	// PreserveImage opts out of localk's automatic dev-image swap for
+	// known clustered chart patterns (Bitnami mongo/rabbit/etc.). By
+	// default localk replaces the production image with a vanilla
+	// upstream one when the chart's StatefulSet+replica setup can't
+	// run sensibly under compose. Set this to true when you actually
+	// need the chart-specific image (custom plugins, TLS, etc.).
+	PreserveImage bool `yaml:"preserve_image,omitempty"`
 }
 
 // BuildOverride mirrors compose's `build:` field. The custom UnmarshalYAML

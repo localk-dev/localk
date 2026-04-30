@@ -788,7 +788,27 @@ services:
   postgres:
     # Use an upstream image locally instead of the custom prod build.
     image: postgres:15-alpine
+
+  mongodb-headless:
+    # Opt out of localk's automatic dev-image swap — keep the
+    # original Bitnami chart image even though it's clustered.
+    # Use this when you depend on chart-specific extensions, plugins,
+    # or TLS configuration baked into the production image.
+    preserve_image: true
 ```
+
+**Automatic dev-image swaps.** When localk sees a clustered Bitnami
+chart pattern in your manifests (mongo replica set, rabbit cluster
+with `USE_LONGNAME`, etc.) it swaps the chart image for a vanilla
+upstream one (`mongo:7`, `rabbitmq:3-management`) that runs as a
+single standalone node speaking the same wire protocol. Compose
+can't run multi-pod clustered StatefulSets sensibly, and the chart's
+bootstrap loop fights every workaround — image swap is the cleaner
+cut. Auth env vars (`MONGODB_ROOT_USER` → `MONGO_INITDB_ROOT_USERNAME`,
+`RABBITMQ_USERNAME` → `RABBITMQ_DEFAULT_USER`) are translated so
+your app's connection strings keep working. A loud warning fires
+each time so the swap is never silent. Disable per-service with
+`preserve_image: true`.
 
 **How service names are matched.** The keys under `services:` match the
 final compose service name, which is the matched k8s `Service` name (or the

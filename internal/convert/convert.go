@@ -230,6 +230,13 @@ func convertWorkload(
 	}
 	res.Warnings = append(res.Warnings, warnings...)
 
+	// Auto-swap clustered chart images for vanilla dev equivalents
+	// (Bitnami mongo replica-set → mongo:7, etc.). Runs before the
+	// user's localk.yaml override so explicit `image:` always wins.
+	if msg := applyDevSwap(name, &main, extras, override.PreserveImage); msg != "" {
+		res.Warnings = append(res.Warnings, msg)
+	}
+
 	applyServiceOverride(&main, override)
 	res.Compose.Services[name] = main
 	for extraName, extra := range extras {
