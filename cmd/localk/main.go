@@ -290,6 +290,23 @@ func runGenerate(args []string) {
 		configFilesWritten++
 	}
 
+	// emptyDir bind-mount targets — k8s gives these world-writable,
+	// kubelet-managed scratch dirs at the right uid/gid via fsGroup.
+	// Compose has no equivalent, so we mkdir each one with mode 0777
+	// on the host before `up`. Containers running as any UID can
+	// read/write; the host user can `rm -rf` the volumes/ tree to
+	// reset state between runs.
+	for relDir := range result.EmptyDirs {
+		fullDir := filepath.Join(*outDir, relDir)
+		if err := os.MkdirAll(fullDir, 0o777); err != nil {
+			fail("creating emptyDir host path %s: %v", fullDir, err)
+		}
+		// MkdirAll honors umask, so chmod again to land on exactly 0777.
+		if err := os.Chmod(fullDir, 0o777); err != nil {
+			fail("chmod %s: %v", fullDir, err)
+		}
+	}
+
 	abs, _ := filepath.Abs(composePath)
 	fmt.Printf("Wrote %s (%d services)\n", abs, len(result.Compose.Services))
 	if envContents != "" {

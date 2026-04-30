@@ -30,7 +30,15 @@ type Result struct {
 	// pointing at the directory. Compose has no native equivalent
 	// of "mount this configmap data as files," so we materialize.
 	ConfigFiles map[string]string
-	Warnings    []string
+	// EmptyDirs is the set of relative directories under the out-dir
+	// that back emptyDir volume mounts. The CLI mkdir's each one
+	// with mode 0777 before docker compose up. Bind-mount here so
+	// any container UID can read/write (k8s would set fsGroup
+	// ownership; compose has no equivalent), and so init→main
+	// shares via the host filesystem the way k8s shares via the
+	// kubelet's emptyDir backing.
+	EmptyDirs map[string]bool
+	Warnings  []string
 }
 
 // Convert translates the given Manifests bundle into a Result. The optional
@@ -43,6 +51,7 @@ func Convert(m *kube.Manifests, cfg *config.Config) (*Result, error) {
 			Volumes:  map[string]compose.Volume{},
 		},
 		ConfigFiles: map[string]string{},
+		EmptyDirs:   map[string]bool{},
 	}
 
 	// Track which volumes we have declared at the top level so we don't
@@ -215,7 +224,7 @@ func convertWorkload(
 		return nil
 	}
 
-	main, extras, warnings, err := convertPod(w, name, m, declaredVolumes, res.Compose, envFileLines, envFileSeen, res.ConfigFiles)
+	main, extras, warnings, err := convertPod(w, name, m, declaredVolumes, res.Compose, envFileLines, envFileSeen, res.ConfigFiles, res.EmptyDirs)
 	if err != nil {
 		return err
 	}
@@ -368,6 +377,7 @@ func convertPod(
 	envFileLines *[]string,
 	envFileSeen map[string]bool,
 	configFiles map[string]string,
+	emptyDirs map[string]bool,
 ) (compose.Service, map[string]compose.Service, []string, error) {
 	var warnings []string
 
@@ -395,7 +405,7 @@ func convertPod(
 	// init with condition: service_completed_successfully.
 	var initNames []string
 	for i, c := range w.pod.Spec.InitContainers {
-		s, w2 := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles)
+		s, w2 := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles, emptyDirs)
 		warnings = append(warnings, w2...)
 		s.Restart = "no"
 		name := mainName + "-" + c.Name
@@ -409,7 +419,7 @@ func convertPod(
 	}
 
 	// --- Main container.
-	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles)
+	main, mainWarnings := buildContainerService(containers[0], w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles, emptyDirs)
 	warnings = append(warnings, mainWarnings...)
 
 	// Service-derived ports are published only by the main's service.
@@ -450,7 +460,7 @@ func convertPod(
 
 	// --- Sidecars (run alongside main, sharing its network namespace).
 	for _, c := range containers[1:] {
-		sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles)
+		sc, scWarnings := buildContainerService(c, w, m, declaredVolumes, out, envFileLines, envFileSeen, decision, configFiles, emptyDirs)
 		warnings = append(warnings, scWarnings...)
 		sc.NetworkMode = "service:" + mainName
 		extras[mainName+"-"+c.Name] = sc
@@ -474,6 +484,7 @@ func buildContainerService(
 	envFileSeen map[string]bool,
 	decision shareDecision,
 	configFiles map[string]string,
+	emptyDirs map[string]bool,
 ) (compose.Service, []string) {
 	multiMount := multiMountedNames(c)
 	var warnings []string
@@ -600,6 +611,12 @@ func buildContainerService(
 		entry, declareName, declared, files, perEntryWarnings := volumeEntryFor(volSrc, vm, decision, multiMount[vm.Name], w.name, m)
 		if entry != nil {
 			svc.Volumes = append(svc.Volumes, entry)
+		}
+		// Bind-mounted emptyDir paths need to exist on the host
+		// before compose up — record relative to out-dir so the
+		// CLI can `mkdir -p` + chmod 0777 each one.
+		if dir := emptyDirHostPath(entry); dir != "" {
+			emptyDirs[dir] = true
 		}
 		if declared && !declaredVolumes[declareName] {
 			out.Volumes[declareName] = compose.Volume{}
@@ -760,8 +777,8 @@ func findVolume(vols []kube.Volume, name string) *kube.Volume {
 //
 // Returns `any` so the entry can be either compose's short string
 // form ("name:/path") or a long-form *compose.MountLong struct;
-// the latter is the only way to encode subpath, which Bitnami helm
-// charts use to carve one emptyDir into per-path subdirectories.
+// the latter is currently used for PVC + subPath only. emptyDir
+// subPath emits a host bind mount instead — see below.
 func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, decision shareDecision, inMultiMount bool, workloadName string, m *kube.Manifests) (any, string, bool, map[string]string, []string) {
 	switch {
 	case v.PVC != nil:
@@ -775,23 +792,31 @@ func volumeEntryFor(v *kube.Volume, vm kube.VolumeMount, decision shareDecision,
 		}
 		return fmt.Sprintf("%s:%s", v.PVC.ClaimName, vm.MountPath), v.PVC.ClaimName, true, nil, nil
 	case v.EmptyDir != nil:
-		// With subPath the volume is partitioned per-path inside the
-		// container; promote unconditionally so init+main can share
-		// via different subPaths in the same backing volume (this is
-		// the Bitnami chart pattern: init copies into <vol>/plugins,
-		// main reads from <vol>/plugins via subPath).
+		// emptyDir with subPath is the Bitnami chart pattern: one
+		// volume sliced into many per-path subdirectories that init
+		// containers populate and main containers read. Compose's
+		// volume.subpath looks like the right tool but breaks in
+		// practice — it requires the subdir to already exist in the
+		// volume on first attach, which it doesn't (compose has no
+		// `pre-create` step). Named volumes also start root-owned,
+		// blocking non-root container writes (Bitnami's UID 1001).
+		//
+		// Bind-mount to a host dir under out-dir/volumes/ instead.
+		// We mkdir it at generate time with mode 0777 so any
+		// container UID can read/write, and init+main share via
+		// the host filesystem the same way k8s shares via the
+		// kubelet's emptyDir backing.
 		if vm.SubPath != "" {
-			named := workloadName + "-" + v.Name
-			return &compose.MountLong{
-				Type:   "volume",
-				Source: named,
-				Target: vm.MountPath,
-				Volume: &compose.MountVolumeOpts{Subpath: vm.SubPath},
-			}, named, true, nil, nil
+			host := fmt.Sprintf("./volumes/%s/%s/%s", workloadName, v.Name, vm.SubPath)
+			return fmt.Sprintf("%s:%s", host, vm.MountPath), "", false, nil, nil
 		}
 		if decision.shouldPromote(v.Name, vm.MountPath, inMultiMount) {
-			named := workloadName + "-" + v.Name
-			return fmt.Sprintf("%s:%s", named, vm.MountPath), named, true, nil, nil
+			// Cross-container shared emptyDir without subPath: bind
+			// to a single host dir for the same auto-create + UID
+			// reasons. (Init+main test case still works — both bind
+			// the same host path, see the same data.)
+			host := fmt.Sprintf("./volumes/%s/%s", workloadName, v.Name)
+			return fmt.Sprintf("%s:%s", host, vm.MountPath), "", false, nil, nil
 		}
 		return vm.MountPath, "", false, nil, nil
 	case v.HostPath != nil:
@@ -824,6 +849,28 @@ func mountStringOrNil(s string) any {
 		return nil
 	}
 	return s
+}
+
+// emptyDirHostPath extracts the host-side relative directory of an
+// emptyDir bind-mount entry, or "" for any other entry type. Used
+// by the convertPod loop to record which directories the CLI should
+// `mkdir -p` before docker compose up. Bind mounts on a non-existent
+// host path silently auto-create as 0755 owned by root which then
+// breaks non-root containers — so we explicitly create + chmod 0777.
+func emptyDirHostPath(entry any) string {
+	s, ok := entry.(string)
+	if !ok {
+		return ""
+	}
+	const prefix = "./volumes/"
+	if !strings.HasPrefix(s, prefix) {
+		return ""
+	}
+	colon := strings.IndexByte(s, ':')
+	if colon < 0 {
+		return ""
+	}
+	return strings.TrimPrefix(s[:colon], "./")
 }
 
 // materializeConfigMap turns a `volumes: { configMap: { name: X } }`

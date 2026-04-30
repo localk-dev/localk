@@ -834,31 +834,35 @@ func TestConvert_Sidecar_SharedEmptyDirPromoted(t *testing.T) {
 		t.Fatalf("Convert: %v", err)
 	}
 
-	// (a) Shared emptyDir promoted to a named volume on both services.
-	wantNamed := "app-logs:" // name is <workload>-<volume.name>
+	// (a) Shared emptyDir maps to a host bind mount under
+	// volumes/<workload>/<vol>/, so init/main/sidecars all see the
+	// same data via the host filesystem (compose's named-volume
+	// semantics had UID-init issues; see volumeEntryFor for the
+	// rationale).
+	wantHost := "./volumes/app/logs:" // <out-dir>/volumes/<workload>/<volume.name>
 	mainVols := result.Compose.Services["app"].Volumes
 	sidecarVols := result.Compose.Services["app-logger"].Volumes
 	mainHasShared := false
 	for _, v := range mainVols {
-		if strings.HasPrefix(mountStr(v), wantNamed) {
+		if strings.HasPrefix(mountStr(v), wantHost) {
 			mainHasShared = true
 			break
 		}
 	}
 	sideHasShared := false
 	for _, v := range sidecarVols {
-		if strings.HasPrefix(mountStr(v), wantNamed) {
+		if strings.HasPrefix(mountStr(v), wantHost) {
 			sideHasShared = true
 			break
 		}
 	}
 	if !mainHasShared || !sideHasShared {
-		t.Errorf("shared emptyDir 'logs' should appear as named volume %q in both services\n  main: %v\n  sidecar: %v", wantNamed, mainVols, sidecarVols)
+		t.Errorf("shared emptyDir 'logs' should appear as bind mount %q in both services\n  main: %v\n  sidecar: %v", wantHost, mainVols, sidecarVols)
 	}
 
-	// (b) Top-level volume declaration exists.
-	if _, present := result.Compose.Volumes["app-logs"]; !present {
-		t.Errorf("expected top-level volume 'app-logs', got %v", result.Compose.Volumes)
+	// (b) Host dir is recorded for mkdir+chmod at generate time.
+	if !result.EmptyDirs["volumes/app/logs"] {
+		t.Errorf("EmptyDirs should record %q so the CLI can mkdir+chmod it; got %v", "volumes/app/logs", result.EmptyDirs)
 	}
 
 	// (c) Non-shared 'scratch' stays an anonymous mount on the main only.
@@ -1026,28 +1030,34 @@ func TestConvert_InitContainer_SharedVolume(t *testing.T) {
 		t.Fatalf("Convert: %v", err)
 	}
 
-	if _, ok := result.Compose.Volumes["app-config"]; !ok {
-		t.Errorf("expected promoted named volume 'app-config' (init+main share it), got %v", result.Compose.Volumes)
-	}
+	// Init+main shared emptyDir now uses a host bind mount instead
+	// of a named compose volume — see the comment in volumeEntryFor
+	// for why (compose subpath limitations + named-volume root
+	// ownership). Both containers bind the same host dir, so the
+	// init's writes are still visible to main.
+	wantHost := "./volumes/app/config"
+	wantInitMount := wantHost + ":/out"
+	wantMainMount := wantHost + ":/etc/app"
 	initVols := result.Compose.Services["app-config-gen"].Volumes
 	mainVols := result.Compose.Services["app"].Volumes
-	wantInitMount := "app-config:/out"
-	wantMainMount := "app-config:/etc/app"
 	hasInit := false
 	for _, v := range initVols {
-		if v == wantInitMount {
+		if mountStr(v) == wantInitMount {
 			hasInit = true
 		}
 	}
 	hasMain := false
 	for _, v := range mainVols {
-		if v == wantMainMount {
+		if mountStr(v) == wantMainMount {
 			hasMain = true
 		}
 	}
 	if !hasInit || !hasMain {
 		t.Errorf("shared volume should appear with the right paths in both services\n  init wants %q in %v\n  main wants %q in %v",
 			wantInitMount, initVols, wantMainMount, mainVols)
+	}
+	if !result.EmptyDirs["volumes/app/config"] {
+		t.Errorf("EmptyDirs should record the host dir %q for mkdir+chmod, got %v", "volumes/app/config", result.EmptyDirs)
 	}
 }
 
@@ -2107,52 +2117,56 @@ func TestConvert_EmptyDir_SubPathSharesVolume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Convert: %v", err)
 	}
-	if _, ok := result.Compose.Volumes["rabbitmq-empty-dir"]; !ok {
-		t.Errorf("named volume rabbitmq-empty-dir should be declared (init+main share via subpaths); got %v", result.Compose.Volumes)
-	}
 
-	// Init's mount has no subPath — short form is fine.
+	// Init mounts the whole volume root: bind to the host dir for
+	// the volume so init writes (cp .../app-plugins-dir) land where
+	// main's per-subpath bind mounts can read them.
 	initMounts := result.Compose.Services["rabbitmq-prepare-plugins-dir"].Volumes
-	wantInit := "rabbitmq-empty-dir:/emptydir"
-	found := false
+	wantInit := "./volumes/rabbitmq/empty-dir:/emptydir"
+	foundInit := false
 	for _, m := range initMounts {
 		if mountStr(m) == wantInit {
-			found = true
+			foundInit = true
 		}
 	}
-	if !found {
-		t.Errorf("init container should mount %q in short form, got %v", wantInit, initMounts)
+	if !foundInit {
+		t.Errorf("init container should bind %q (host dir for whole volume), got %v", wantInit, initMounts)
 	}
 
-	// Each main mount must be long-form referencing the same named
-	// volume + its specific subpath.
+	// Each main mount with subPath becomes a bind to the
+	// corresponding subdirectory under the volume's host dir.
 	mainMounts := result.Compose.Services["rabbitmq"].Volumes
 	wantSubpaths := map[string]string{
-		"/tmp":                                    "tmp-dir",
-		"/opt/bitnami/rabbitmq/plugins":           "app-plugins-dir",
-		"/opt/bitnami/rabbitmq/etc/rabbitmq":      "app-conf-dir",
-		"/opt/bitnami/rabbitmq/var/lib/rabbitmq":  "app-data-dir",
-		"/opt/bitnami/rabbitmq/.rabbitmq":         "rabbitmq-conf-dir",
+		"/tmp":                                   "tmp-dir",
+		"/opt/bitnami/rabbitmq/plugins":          "app-plugins-dir",
+		"/opt/bitnami/rabbitmq/etc/rabbitmq":     "app-conf-dir",
+		"/opt/bitnami/rabbitmq/var/lib/rabbitmq": "app-data-dir",
+		"/opt/bitnami/rabbitmq/.rabbitmq":        "rabbitmq-conf-dir",
 	}
-	got := map[string]string{}
-	for _, m := range mainMounts {
-		long, ok := m.(*compose.MountLong)
-		if !ok {
-			continue
+	for path, sub := range wantSubpaths {
+		want := "./volumes/rabbitmq/empty-dir/" + sub + ":" + path
+		found := false
+		for _, m := range mainMounts {
+			if mountStr(m) == want {
+				found = true
+				break
+			}
 		}
-		if long.Source != "rabbitmq-empty-dir" {
-			t.Errorf("expected long-form source rabbitmq-empty-dir, got %q", long.Source)
+		if !found {
+			t.Errorf("expected bind mount %q in main, got %v", want, mainMounts)
 		}
-		if long.Volume == nil {
-			t.Errorf("long-form mount should carry a volume.subpath, got %+v", long)
-			continue
-		}
-		got[long.Target] = long.Volume.Subpath
 	}
-	for path, want := range wantSubpaths {
-		if got[path] != want {
-			t.Errorf("mount at %q: subpath = %q, want %q (full got=%v)", path, got[path], want, got)
+
+	// Each subpath dir + the volume root must be in EmptyDirs so
+	// the CLI mkdirs them with mode 0777 before compose up.
+	for _, sub := range wantSubpaths {
+		want := "volumes/rabbitmq/empty-dir/" + sub
+		if !result.EmptyDirs[want] {
+			t.Errorf("EmptyDirs should record %q for mkdir+chmod, got %v", want, result.EmptyDirs)
 		}
+	}
+	if !result.EmptyDirs["volumes/rabbitmq/empty-dir"] {
+		t.Errorf("EmptyDirs should record the volume root %q (init mounts it whole), got %v", "volumes/rabbitmq/empty-dir", result.EmptyDirs)
 	}
 }
 
