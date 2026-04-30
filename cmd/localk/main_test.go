@@ -2,8 +2,11 @@ package main
 
 import (
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/localk-dev/localk/internal/kube"
 )
 
 func TestResolveOutPath(t *testing.T) {
@@ -60,5 +63,112 @@ EMPTY_LINE_ABOVE=plainvalue
 		if strings.Contains(got, leaked) {
 			t.Errorf("secret value %q leaked into redacted output:\n%s", leaked, got)
 		}
+	}
+}
+
+func TestIndexEq(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"-flag=value", 5},
+		{"-flag value", -1},
+		{"--out-dir=foo", 9},
+		{"plain", -1},
+		{"=at-start", 0},
+		{"", -1},
+	}
+	for _, tc := range cases {
+		if got := indexEq(tc.in); got != tc.want {
+			t.Errorf("indexEq(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestDisplayNamespaceAndContext(t *testing.T) {
+	if got := displayNamespace(""); got != "(current)" {
+		t.Errorf("displayNamespace empty = %q, want (current)", got)
+	}
+	if got := displayNamespace("staging"); got != "staging" {
+		t.Errorf("displayNamespace(staging) = %q", got)
+	}
+	if got := displayContext(""); got != "(current)" {
+		t.Errorf("displayContext empty = %q, want (current)", got)
+	}
+	if got := displayContext("prod-eu1"); got != "prod-eu1" {
+		t.Errorf("displayContext(prod-eu1) = %q", got)
+	}
+}
+
+func TestHasWorkloads(t *testing.T) {
+	cases := []struct {
+		name string
+		m    *kube.Manifests
+		want bool
+	}{
+		{"empty", &kube.Manifests{}, false},
+		{"only deployment", &kube.Manifests{Deployments: []kube.Deployment{{}}}, true},
+		{"only statefulset", &kube.Manifests{StatefulSets: []kube.StatefulSet{{}}}, true},
+		{"both", &kube.Manifests{Deployments: []kube.Deployment{{}}, StatefulSets: []kube.StatefulSet{{}}}, true},
+		// Services / ConfigMaps alone aren't workloads — just supporting cast.
+		{"only services", &kube.Manifests{Services: []kube.Service{{}}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasWorkloads(tc.m); got != tc.want {
+				t.Errorf("hasWorkloads(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReorderFlagsFirst(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "positional first, flag-with-value second",
+			in:   []string{"./k8s", "-o", "out.yml"},
+			want: []string{"-o", "out.yml", "./k8s"},
+		},
+		{
+			name: "positional between two flags",
+			in:   []string{"-o", "out.yml", "./k8s", "--dry-run"},
+			want: []string{"-o", "out.yml", "--dry-run", "./k8s"},
+		},
+		{
+			name: "flag with = doesn't take a separate value",
+			in:   []string{"./k8s", "--out-dir=build"},
+			want: []string{"--out-dir=build", "./k8s"},
+		},
+		{
+			name: "boolean flag has no value",
+			in:   []string{"--dry-run", "./k8s"},
+			want: []string{"--dry-run", "./k8s"},
+		},
+		{
+			// reorderFlagsFirst only recognizes its registered flag set;
+			// anything else stays where it was. This matters because if
+			// it greedily reordered every -dash arg, a positional like
+			// `./relative-path` would get yanked out of place.
+			name: "unknown flag-looking arg is left positional",
+			in:   []string{"./k8s", "-mystery"},
+			want: []string{"./k8s", "-mystery"},
+		},
+		{
+			name: "no flags, just positionals",
+			in:   []string{"a", "b", "c"},
+			want: []string{"a", "b", "c"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reorderFlagsFirst(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("reorderFlagsFirst(%v):\n  got  %v\n  want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
