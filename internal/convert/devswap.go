@@ -253,6 +253,15 @@ func applyDevSwap(
 		if rule.transformService != nil {
 			rule.transformService(main, lookup)
 		}
+		// The k8s-FQDN hostname we set for cluster-mode workloads
+		// (mongodb.mongodb-headless.default.svc.cluster.local etc.)
+		// exists to make Erlang's USE_LONGNAME binding work for
+		// rabbit and similar. Vanilla images don't need it, and
+		// some (mongo:7's first-stage setup mongod) reject it
+		// outright with "setup bind: Invalid argument" — clear it
+		// and let docker assign the default short container hostname.
+		// Network aliases still cover external lookups.
+		main.Hostname = ""
 		dropInitContainers(svcName, main, extras)
 		return fmt.Sprintf(
 			"%s detected on workload %q: replaced image %q with %q for local dev. The chart's clustered bootstrap doesn't translate to compose; the dev image runs as a single standalone node speaking the same wire protocol. Set services.%s.preserve_image: true in localk.yaml to keep the chart image.",

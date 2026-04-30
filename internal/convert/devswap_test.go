@@ -200,6 +200,32 @@ func TestApplyDevSwap_TranslatesSecretSourcedAuth(t *testing.T) {
 	}
 }
 
+// TestApplyDevSwap_ClearsClusterFQDNHostname covers a real failure
+// in mp-production: with hostname set to the cluster FQDN
+// (`mongodb.mongodb-headless.default.svc.cluster.local`, added for
+// Erlang/cluster self-resolution), mongo:7's first-stage setup
+// mongod fails on bind() with "Invalid argument" before users can
+// be created. Vanilla images don't need the FQDN hostname — network
+// aliases handle external lookups — so the swap clears it.
+func TestApplyDevSwap_ClearsClusterFQDNHostname(t *testing.T) {
+	main := &compose.Service{
+		Image:    "docker.io/bitnami/mongodb:7.0",
+		Hostname: "mongodb.mongodb-headless.default.svc.cluster.local",
+		Environment: map[string]string{
+			"MONGODB_REPLICA_SET_MODE": "primary",
+			"MONGODB_ROOT_USER":        "root",
+			"MONGODB_ROOT_PASSWORD":    "x",
+		},
+	}
+	msg := applyDevSwap("mongodb-headless", main, nil, false, nil, nil, nil)
+	if msg == "" {
+		t.Fatalf("expected dev-swap warning")
+	}
+	if main.Hostname != "" {
+		t.Errorf("Hostname should be cleared after swap, got %q", main.Hostname)
+	}
+}
+
 // TestApplyDevSwap_ResolvesPasswordFileIndirection covers the
 // real-world Bitnami mongo pattern: the chart sets
 //
