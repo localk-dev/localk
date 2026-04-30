@@ -24,6 +24,9 @@ Usage:
   localk generate -k [-n <namespace>] [--context <name>] [-y] [--out-dir <dir>] [--config <file>] [--dry-run]
   localk up   [--out-dir <dir>] [-f <file>] [--build] [--no-detach] [-- DOCKER_COMPOSE_ARGS...]
   localk down [--out-dir <dir>] [-f <file>] [-v] [-- DOCKER_COMPOSE_ARGS...]
+  localk dev  <service> --port <host-port> [--out-dir <dir>] [--container-port <n>]
+  localk dev  --stop <service> [--out-dir <dir>]
+  localk dev  --list [--out-dir <dir>]
   localk version
   localk help
 
@@ -38,6 +41,11 @@ Commands:
               or -f is given.
   down        Stop the stack via 'docker compose down'. Pass -v to also
               delete named volumes (DESTRUCTIVE).
+  dev         Put one service into dev mode: replace it in compose with a
+              proxy that forwards traffic to host.docker.internal:<port>,
+              so you can run that service in your IDE while the rest of
+              the stack keeps running. --stop restores. --list shows what's
+              currently in dev mode.
   version     Print version and exit.
   help        Print this help and exit.
 
@@ -68,6 +76,8 @@ func main() {
 		runUp(os.Args[2:])
 	case "down":
 		runDown(os.Args[2:])
+	case "dev":
+		runDev(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("localk", version)
 	case "help", "-h", "--help":
@@ -404,17 +414,23 @@ func writeFile(path string, data []byte) error {
 // otherwise stop parsing at `./k8s`.
 func reorderFlagsFirst(args []string) []string {
 	knownFlags := map[string]bool{
-		"-o":          true,
-		"-env-out":    true,
-		"--env-out":   true,
-		"--o":         true,
-		"-n":          true,
-		"--namespace": true,
-		"--context":   true,
-		"-out-dir":    true,
-		"--out-dir":   true,
-		"-config":     true,
-		"--config":    true,
+		"-o":               true,
+		"-env-out":         true,
+		"--env-out":        true,
+		"--o":              true,
+		"-n":               true,
+		"--namespace":      true,
+		"--context":        true,
+		"-out-dir":         true,
+		"--out-dir":        true,
+		"-config":          true,
+		"--config":         true,
+		"-port":            true,
+		"--port":           true,
+		"-container-port":  true,
+		"--container-port": true,
+		"-stop":            true,
+		"--stop":           true,
 	}
 	knownBoolFlags := map[string]bool{
 		"-k":             true,
@@ -422,6 +438,8 @@ func reorderFlagsFirst(args []string) []string {
 		"-y":             true,
 		"--yes":          true,
 		"--dry-run":      true,
+		"-list":          true,
+		"--list":         true,
 	}
 
 	var flagsArgs, positional []string

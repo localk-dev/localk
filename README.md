@@ -118,6 +118,75 @@ localk down -- --timeout 5
 regenerate the compose file — that's always `localk generate`'s job — so a
 failure points clearly at one side or the other.
 
+## Working on one service (`localk dev`)
+
+The whole point: pull your prod stack down with `localk generate -k`,
+bring it up with `localk up`, then **stop one service** in compose and
+run that service in your IDE while everything else keeps running. Other
+services in the stack still call `<service>:<port>` and traffic
+transparently reaches your local process.
+
+```bash
+# Start the stack
+localk up
+
+# Take `gateway-rental-partner` out of compose and route its traffic
+# to your laptop on port 3000:
+localk dev gateway-rental-partner --port 3000
+
+# (Run your service in VSCode / your IDE on localhost:3000)
+
+# When done, put the original service back:
+localk dev --stop gateway-rental-partner
+localk up   # bounces the original service back into the stack
+```
+
+Under the hood, `localk dev` writes a `docker-compose.dev.yml` overlay
+next to your compose file with a tiny [socat](https://www.kali.org/tools/socat/)
+proxy service that forwards the stopped service's port to
+`host.docker.internal:<your-host-port>`. `localk up` and `localk down`
+auto-detect the overlay and include it.
+
+After `localk dev <service> --port <n>`, localk prints:
+
+- The host port to bind your local process on.
+- A list of other services you can reach as `localhost:<port>`.
+- Useful env vars (the service's `environment:` map and `.env` contents)
+  with hostnames remapped to `localhost` where applicable, so you can
+  paste them into your IDE config.
+
+```text
+Service "gateway-rental-partner" is now in dev mode.
+
+Run your code on:        localhost:3000
+Reachable from stack at: http://gateway-rental-partner:80
+
+Other services reachable from your laptop:
+  postgres                       localhost:5432
+  rabbitmq                       localhost:5672
+  redis-stack-server             localhost:6379
+
+Useful env vars (hostnames remapped for host access — review before pasting):
+  DATABASE_URL=postgres://localhost:5432/app
+  REDIS_URL=redis://localhost:6379
+  ...
+
+When done: localk dev --stop gateway-rental-partner --out-dir .
+```
+
+Multiple services can be in dev mode simultaneously (each on its own
+host port); `localk dev --list` shows what's currently swapped out.
+`localk dev --stop <service>` removes a single entry; the overlay file
+is removed automatically when the last entry leaves.
+
+`--container-port` overrides the in-network port (defaults to the
+service's first published container port, or 80 if none — typical for
+services that sit behind an Ingress).
+
+> Linux note: the proxy uses `host.docker.internal:host-gateway` to
+> reach the host. macOS and Windows already have `host.docker.internal`
+> mapped automatically; the entry is harmless on every platform.
+
 ## Previewing the output (`--dry-run`)
 
 Add `--dry-run` to any `generate` invocation to print exactly what would be

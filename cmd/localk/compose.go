@@ -32,7 +32,9 @@ func runUp(args []string) {
 		fail("%v", err)
 	}
 
-	dcArgs := []string{"compose", "-f", path, "up"}
+	dcArgs := []string{"compose", "-f", path}
+	dcArgs = appendDevOverlayIfPresent(dcArgs, *outDir)
+	dcArgs = append(dcArgs, "up")
 	if !*noDetach {
 		dcArgs = append(dcArgs, "-d")
 	}
@@ -68,13 +70,28 @@ func runDown(args []string) {
 		fail("%v", err)
 	}
 
-	dcArgs := []string{"compose", "-f", path, "down"}
+	dcArgs := []string{"compose", "-f", path}
+	dcArgs = appendDevOverlayIfPresent(dcArgs, *outDir)
+	dcArgs = append(dcArgs, "down")
 	if *volumes {
 		dcArgs = append(dcArgs, "-v")
 	}
 	dcArgs = append(dcArgs, passthrough...)
 
 	execDocker(dcArgs)
+}
+
+// appendDevOverlayIfPresent extends dcArgs with `-f <overlay>` when
+// docker-compose.dev.yml exists alongside the base compose file.
+// Presence is the signal — no flag required — so `localk up` keeps
+// honoring whatever the developer has set up via `localk dev` without
+// extra ceremony.
+func appendDevOverlayIfPresent(dcArgs []string, outDir string) []string {
+	overlay := filepath.Join(outDir, overlayFilename)
+	if _, err := os.Stat(overlay); err == nil {
+		dcArgs = append(dcArgs, "-f", overlay)
+	}
+	return dcArgs
 }
 
 // resolveExistingCompose resolves a compose file path the same way
