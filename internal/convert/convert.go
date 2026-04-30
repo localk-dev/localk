@@ -99,6 +99,12 @@ func Convert(m *kube.Manifests, cfg *config.Config) (*Result, error) {
 		res.CaddyFile = caddyfile
 	}
 
+	// Final pass: resolve any remaining host-port conflicts. Multiple
+	// services declaring the same host port (with or without an
+	// Ingress in the picture) would otherwise crash compose at `up`
+	// time on the second bind.
+	res.Warnings = append(res.Warnings, resolveHostPortConflicts(res.Compose.Services)...)
+
 	return res, nil
 }
 

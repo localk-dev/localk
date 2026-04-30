@@ -278,6 +278,103 @@ func isEphemeralIngress(ing kube.Ingress) bool {
 	return false
 }
 
+// resolveHostPortConflicts walks every service's Ports and drops any
+// host-port mapping that's already been claimed by an earlier service.
+// Two scenarios surface this:
+//
+//  1. An Ingress-driven stack: Caddy proxy publishes :80, and some
+//     non-routed services in the manifest also declare host:80.
+//     Without resolution, `docker compose up` fails on the second
+//     bind.
+//  2. A no-Ingress stack where multiple services genuinely declare
+//     the same host port (rare, but k8s tolerates it because
+//     NodePort uses different host ports — compose doesn't have an
+//     equivalent abstraction).
+//
+// Resolution: first-claim wins. Any service named "proxy" (the Caddy
+// service we emit) is processed first so it always keeps its bind.
+// Dropped mappings produce a warning naming the service so the user
+// knows what went where. Affected services remain reachable through
+// the compose network for service-to-service traffic.
+func resolveHostPortConflicts(services map[string]compose.Service) []string {
+	var warnings []string
+	claimed := map[string]string{}
+
+	// Proxy first — its publish is what makes Ingress work; everything
+	// else can lose theirs.
+	if proxy, ok := services["proxy"]; ok {
+		for _, p := range proxy.Ports {
+			if h := hostPortPrefix(p); h != "" {
+				claimed[h] = "proxy"
+			}
+		}
+	}
+
+	// Iterate other services in sorted order so the warning text is
+	// deterministic across runs.
+	names := make([]string, 0, len(services))
+	for name := range services {
+		if name != "proxy" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		s := services[name]
+		var kept []string
+		var dropped []string
+		for _, p := range s.Ports {
+			h := hostPortPrefix(p)
+			if h == "" {
+				kept = append(kept, p)
+				continue
+			}
+			if claimer, taken := claimed[h]; taken {
+				dropped = append(dropped, fmt.Sprintf("%s (claimed by %q)", p, claimer))
+				continue
+			}
+			claimed[h] = name
+			kept = append(kept, p)
+		}
+		if len(dropped) > 0 {
+			s.Ports = kept
+			services[name] = s
+			warnings = append(warnings, fmt.Sprintf(
+				"service %q: dropped host-port mapping(s) %v — reachable via the compose network only. To publish on a different host port, override in localk.yaml or use `localk dev` to swap it for a local process.",
+				name, dropped,
+			))
+		}
+	}
+	return warnings
+}
+
+// hostPortPrefix extracts the host-side port from a compose Ports
+// string ("80:80", "8080:80", "127.0.0.1:80:80/tcp") for conflict
+// detection. Returns "" when the entry has no explicit host port
+// (e.g. just ":80" — uncommon but possible) since those don't
+// participate in conflicts.
+func hostPortPrefix(p string) string {
+	// Trim "/tcp", "/udp" suffixes.
+	if i := strings.Index(p, "/"); i >= 0 {
+		p = p[:i]
+	}
+	parts := strings.Split(p, ":")
+	switch len(parts) {
+	case 2:
+		// "host:container" — the first part is the host port.
+		return parts[0]
+	case 3:
+		// "ip:host:container" — middle is the host port. Include the
+		// IP in the key so 127.0.0.1:80 and 0.0.0.0:80 don't appear
+		// to conflict (they technically do at OS level on the same
+		// interface, but compose treats explicit-IP binds as a
+		// distinct surface).
+		return parts[0] + ":" + parts[1]
+	}
+	return ""
+}
+
 // stripBackendPorts clears the Ports field for each compose service that
 // is referenced as an Ingress backend. After this, only the proxy
 // publishes :80 to the host; backends are reachable via the proxy and

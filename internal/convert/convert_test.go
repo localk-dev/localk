@@ -2,6 +2,7 @@ package convert_test
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -368,6 +369,107 @@ func TestConvert_Ingress_MissingBackendWarns(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected a warning about the missing backend, got %v", result.Warnings)
+	}
+}
+
+// TestConvert_HostPortConflictsDropped covers the case where multiple
+// services in the input declare the same host port. Real-world hits:
+// k8s manifests where 30 services all serve container :80, plus a
+// Caddy proxy from the Ingress feature also wanting :80. compose
+// would crash on the second bind; we resolve by dropping the
+// conflicts (proxy keeps it; first sorted name otherwise) and
+// surfacing a warning naming each affected service.
+func TestConvert_HostPortConflictsDropped(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{
+			deploymentWithPort("api", 80, map[string]string{"app": "api"}),
+			deploymentWithPort("worker", 80, map[string]string{"app": "worker"}),
+			deploymentWithPort("data-svc", 80, map[string]string{"app": "data-svc"}),
+		},
+		Services: []kube.Service{
+			serviceFor("api", 80, map[string]string{"app": "api"}),
+			serviceFor("worker", 80, map[string]string{"app": "worker"}),
+			serviceFor("data-svc", 80, map[string]string{"app": "data-svc"}),
+		},
+		// One Ingress so a Caddy proxy gets emitted on :80. `api` is
+		// behind it; worker and data-svc are not.
+		Ingresses: []kube.Ingress{{
+			Metadata: kube.ObjectMeta{Name: "web"},
+			Spec: kube.IngressSpec{Rules: []kube.IngressRule{{
+				Host: "app.example.com",
+				HTTP: &kube.IngressRuleHTTP{Paths: []kube.IngressPath{
+					{Path: "/", Backend: backendOn("api", 80)},
+				}},
+			}}},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	// proxy keeps its 80:80 mapping (claimed first).
+	proxy := result.Compose.Services["proxy"]
+	if len(proxy.Ports) != 1 || proxy.Ports[0] != "80:80" {
+		t.Errorf("proxy.Ports = %v, want [80:80]", proxy.Ports)
+	}
+
+	// api (Ingress backend) had its host port stripped already.
+	api := result.Compose.Services["api"]
+	if len(api.Ports) != 0 {
+		t.Errorf("api as Ingress backend should have no Ports; got %v", api.Ports)
+	}
+
+	// worker and data-svc — not behind Ingress, both wanted 80:80;
+	// the conflict resolver should have dropped both since proxy
+	// already claimed :80.
+	for _, name := range []string{"worker", "data-svc"} {
+		s := result.Compose.Services[name]
+		if len(s.Ports) != 0 {
+			t.Errorf("service %q should have its conflicting :80 mapping dropped; got %v", name, s.Ports)
+		}
+	}
+
+	// Two services lost their bindings → two warnings naming them.
+	for _, name := range []string{"worker", "data-svc"} {
+		found := false
+		for _, w := range result.Warnings {
+			if strings.Contains(w, fmt.Sprintf("%q", name)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected a warning naming %q; got %v", name, result.Warnings)
+		}
+	}
+}
+
+// TestConvert_HostPortFirstClaimWins handles the no-Ingress case:
+// two unrelated services both declaring host:80. Without a proxy to
+// prioritize, the first service (alphabetical) keeps the port and
+// the others lose theirs — same start-the-stack-or-don't trade-off,
+// just with a different winner.
+func TestConvert_HostPortFirstClaimWins(t *testing.T) {
+	manifests := &kube.Manifests{
+		Deployments: []kube.Deployment{
+			deploymentWithPort("zebra", 80, map[string]string{"app": "zebra"}),
+			deploymentWithPort("alpha", 80, map[string]string{"app": "alpha"}),
+		},
+		Services: []kube.Service{
+			serviceFor("zebra", 80, map[string]string{"app": "zebra"}),
+			serviceFor("alpha", 80, map[string]string{"app": "alpha"}),
+		},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	if got := result.Compose.Services["alpha"].Ports; len(got) != 1 || got[0] != "80:80" {
+		t.Errorf("alpha (sorted first) should keep its 80:80; got %v", got)
+	}
+	if got := result.Compose.Services["zebra"].Ports; len(got) != 0 {
+		t.Errorf("zebra should have its conflict dropped; got %v", got)
 	}
 }
 
