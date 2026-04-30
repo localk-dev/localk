@@ -162,17 +162,37 @@ func (l envLookup) addToEnvFile(name, value string) {
 	*l.envFileLines = append(*l.envFileLines, fmt.Sprintf(`%s="%s"`, name, escaped))
 }
 
-// influxdbSetupGuardCommand wraps influxdb:2.x's entrypoint with a
-// guard that drops DOCKER_INFLUXDB_INIT_MODE=setup once the bolt
-// file exists. Without this, a container restart re-runs `influx
-// setup` against an already-initialized database and crashes on
-// `influx config create --config-name default ... already exists`
-// — a long-standing bug in influxdata's official docker entrypoint
-// (see influxdata-docker#506). The check is idempotent and
-// invisible on first start (bolt absent → setup runs normally).
+// influxdbSetupGuardCommand wraps influxdb:2.x's entrypoint to
+// work around two long-standing bugs in influxdata's docker
+// entrypoint (see influxdata-docker#506) that surface as
+// "config name 'default' already exists" crash-loops in compose:
+//
+//  1. DOCKER_INFLUXDB_INIT_MODE=setup re-runs setup on every
+//     container start. The entrypoint does check for an existing
+//     bolt file and skips setup when present, but if a previous
+//     setup partially failed and the entrypoint wiped the bolt,
+//     the next start re-runs setup. We unset MODE explicitly when
+//     bolt is non-empty so a healthy database is never asked to
+//     re-bootstrap.
+//
+//  2. The image declares VOLUME /etc/influxdb2 in its Dockerfile,
+//     so docker materializes an anonymous volume there that
+//     PERSISTS across container restarts. The CLI configs file
+//     (/etc/influxdb2/influx-configs, written during setup) lives
+//     in that volume. When setup partially fails and the
+//     entrypoint cleans /var/lib/influxdb2, the anonymous volume
+//     keeps the "default" config entry — so the next setup
+//     attempt's `influx config create --config-name default`
+//     errors with "already exists" forever. Clear the configs
+//     file before setup runs so each setup is genuinely from
+//     scratch.
 const influxdbSetupGuardCommand = `if [ -s /var/lib/influxdb2/influxd.bolt ] && [ "$DOCKER_INFLUXDB_INIT_MODE" = "setup" ]; then
   echo "[localk] influxdb already initialized; skipping setup mode for this restart"
   unset DOCKER_INFLUXDB_INIT_MODE
+fi
+if [ "$DOCKER_INFLUXDB_INIT_MODE" = "setup" ]; then
+  echo "[localk] clearing stale CLI configs in /etc/influxdb2/ before setup"
+  rm -f /etc/influxdb2/influx-configs 2>/dev/null || true
 fi
 exec /entrypoint.sh influxd`
 
