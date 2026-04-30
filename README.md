@@ -585,10 +585,24 @@ nats:
         - nats-2.nats-headless.default.svc.cluster.local
 ```
 
+Bitnami helm charts often bake the workload-name form
+(`<workload>.<headless>.<ns>.svc.cluster.local`) into env vars instead
+of pod ordinals. localk emits that form too whenever there's a
+headless sibling, so RabbitMQ's `RABBITMQ_NODE_NAME` and similar
+work without manual fixup.
+
 Compose still runs a single container per workload, but every
-ordinal alias resolves to it — so apps that loop over
-`<sts>-0`, `<sts>-1`, `<sts>-2` connection strings hit the same
-backend instead of failing with `ENOTFOUND`.
+alias resolves to it — so apps that loop over `<sts>-0`,
+`<sts>-1`, `<sts>-2` connection strings hit the same backend
+instead of failing with `ENOTFOUND`.
+
+For workloads with a headless service, localk also sets the compose
+service's `hostname:` to the canonical FQDN
+(`<workload>.<headless>.<ns>.svc.cluster.local`). Aliases cover DNS
+lookups from *other* containers; this covers the container looking
+up its own FQDN. Apps that bind a listener to their own FQDN at
+startup — Erlang with `USE_LONGNAME=true`, Akka, etcd, Cassandra —
+need this or they hang forever in the bind step.
 
 ### Sidecar containers
 

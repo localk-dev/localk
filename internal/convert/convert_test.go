@@ -1962,6 +1962,66 @@ func TestConvert_FQDNAliases_HeadlessStatefulSet(t *testing.T) {
 	}
 }
 
+// TestConvert_FQDNAliases_BitnamiPattern covers the form Bitnami
+// helm charts bake into env vars: <workload>.<headless>.<ns>.svc.cluster.local
+// (no pod ordinal). The previous code only emitted <workload>-N forms,
+// leaving Bitnami's RABBITMQ_NODE_NAME hostname unresolvable and
+// hanging the Erlang node binding.
+func TestConvert_FQDNAliases_BitnamiPattern(t *testing.T) {
+	manifests := &kube.Manifests{
+		Services: []kube.Service{
+			{
+				Metadata: kube.ObjectMeta{Name: "rabbitmq", Namespace: "default"},
+				Spec: kube.ServiceSpec{
+					Selector: map[string]string{"app": "rabbitmq"},
+					Ports:    []kube.ServicePort{{Port: 5672}},
+				},
+			},
+			{
+				Metadata: kube.ObjectMeta{Name: "rabbitmq-headless", Namespace: "default"},
+				Spec: kube.ServiceSpec{
+					Selector:  map[string]string{"app": "rabbitmq"},
+					Ports:     []kube.ServicePort{{Port: 5672}},
+					ClusterIP: "None",
+				},
+			},
+		},
+		Deployments: []kube.Deployment{{
+			Metadata: kube.ObjectMeta{Name: "rabbitmq", Namespace: "default"},
+			Spec: kube.DeploymentSpec{
+				Selector: kube.LabelSelect{MatchLabels: map[string]string{"app": "rabbitmq"}},
+				Template: kube.PodTemplate{
+					Metadata: kube.ObjectMeta{Labels: map[string]string{"app": "rabbitmq"}},
+					Spec: kube.PodSpec{
+						Containers: []kube.Container{{Name: "rabbitmq", Image: "bitnami/rabbitmq:3.13"}},
+					},
+				},
+			},
+		}},
+	}
+	result, err := convert.Convert(manifests, nil)
+	if err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+	rabbit := result.Compose.Services["rabbitmq"]
+	want := "rabbitmq.rabbitmq-headless.default.svc.cluster.local"
+
+	// Alias for the form RABBITMQ_NODE_NAME uses must be present.
+	have := map[string]bool{}
+	for _, a := range rabbit.Networks["default"].Aliases {
+		have[a] = true
+	}
+	if !have[want] {
+		t.Errorf("missing Bitnami-pattern alias %q in %v", want, rabbit.Networks["default"].Aliases)
+	}
+
+	// And hostname must be set so Erlang's node-binding self-lookup
+	// succeeds — aliases only cover lookups from OTHER containers.
+	if rabbit.Hostname != want {
+		t.Errorf("compose Hostname should be %q (so the container can resolve its own FQDN), got %q", want, rabbit.Hostname)
+	}
+}
+
 // TestConvert_FQDNAliases_DeploymentNoPodOrdinals guards against
 // emitting StatefulSet-style pod-N aliases for plain Deployments,
 // which don't have stable pod hostnames.

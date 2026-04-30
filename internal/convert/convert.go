@@ -294,19 +294,63 @@ func fqdnAliasesFor(mainName string, w workload, services []*kube.Service) []str
 		}
 		suffixes(s.Metadata.Name, ns)
 
-		// Headless services (clusterIP: None) front StatefulSet pods
-		// individually. Generate per-pod FQDNs only for that case so
-		// regular ClusterIP services don't bloat the alias list.
-		if w.kindLabel == "statefulset" && s.Spec.ClusterIP == "None" {
-			for i := int32(0); i < replicas; i++ {
-				pod := fmt.Sprintf("%s-%d", w.name, i)
-				add(pod)
-				suffixes(pod+"."+s.Metadata.Name, ns)
+		// Headless services (clusterIP: None) front pod-level DNS.
+		// In k8s the canonical pod FQDN is
+		//   <pod-hostname>.<headless-svc>.<ns>.svc.cluster.local
+		// Charts vary on what the pod hostname ends up being:
+		//
+		//   * StatefulSets default to "<sts>-<i>" so we emit those
+		//     ordinal forms (mongodb-0, mongodb-1, ...).
+		//   * Bitnami charts and many Deployments use the workload
+		//     name directly (helm fullnameOverride, or `hostname:`
+		//     on the pod template), giving "<workload>.<headless>...".
+		//
+		// We emit BOTH so we don't have to guess which form an env
+		// var was baked with. Compose still runs one container per
+		// workload; every alias resolves to the same backend.
+		if s.Spec.ClusterIP == "None" {
+			suffixes(w.name+"."+s.Metadata.Name, ns)
+			if w.kindLabel == "statefulset" {
+				for i := int32(0); i < replicas; i++ {
+					pod := fmt.Sprintf("%s-%d", w.name, i)
+					add(pod)
+					suffixes(pod+"."+s.Metadata.Name, ns)
+				}
 			}
 		}
 	}
 	sort.Strings(out)
 	return out
+}
+
+// fqdnSelfHostnameFor picks a single FQDN to set as the compose
+// service's `hostname:`. The reason this matters even when aliases
+// already cover the FQDN: docker's embedded DNS resolver gives
+// network aliases to *other* containers, but a container looking
+// up its OWN FQDN goes through libc, which only sees what's in
+// /etc/hosts. Without a matching hostname, apps that bind to their
+// own FQDN (Erlang with USE_LONGNAME=true, Akka, etcd, Cassandra,
+// rabbit's Erlang node) hang during startup.
+//
+// Returns "" when no headless service fronts the workload — short
+// names work fine in that case and we don't want to surprise apps
+// that look at gethostname() expecting an unqualified label.
+func fqdnSelfHostnameFor(w workload, services []*kube.Service) string {
+	for _, s := range services {
+		if s.Spec.ClusterIP != "None" {
+			continue
+		}
+		ns := s.Metadata.Namespace
+		if ns == "" {
+			ns = "default"
+		}
+		// Match the pod-hostname-equals-workload-name pattern that
+		// Bitnami charts use; this is the single FQDN form most
+		// likely to appear in baked-in env vars (RABBITMQ_NODE_NAME
+		// etc.).
+		return fmt.Sprintf("%s.%s.%s.svc.cluster.local", w.name, s.Metadata.Name, ns)
+	}
+	return ""
 }
 
 // convertPod walks every container in the pod and produces:
@@ -389,6 +433,13 @@ func convertPod(
 			main.Networks = map[string]compose.ServiceNetwork{
 				"default": {Aliases: aliases},
 			}
+		}
+		// When a headless service fronts the workload, set the
+		// container's hostname to the canonical FQDN so apps that
+		// resolve their own FQDN at startup (Erlang, Akka, etcd)
+		// can bind. Aliases alone don't cover self-resolution.
+		if h := fqdnSelfHostnameFor(w, allMatched); h != "" {
+			main.Hostname = h
 		}
 	}
 	if len(initNames) > 0 {

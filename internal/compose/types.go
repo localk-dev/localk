@@ -41,6 +41,14 @@ type Service struct {
 	// only ships amd64 builds. Empty means "no preference" (Docker
 	// picks based on the host arch).
 	Platform string `yaml:"platform,omitempty"`
+	// Hostname is the unix hostname inside the container. Set this
+	// to a k8s FQDN form for workloads whose own env vars / config
+	// reference the FQDN — Erlang's `USE_LONGNAME=true`, Akka,
+	// distributed RPC, etc. all do `gethostbyname(self_fqdn)` to
+	// bind their listener; without a matching hostname Docker's
+	// embedded DNS resolves the FQDN for *other* containers but
+	// not for the container itself, and the bind fails.
+	Hostname string `yaml:"hostname,omitempty"`
 }
 
 // DependsOnSpec is the long-form depends_on entry. Common conditions:
