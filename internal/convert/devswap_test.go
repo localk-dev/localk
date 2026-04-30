@@ -40,7 +40,7 @@ func TestApplyDevSwap_BitnamiMongoSwapsToMongo7(t *testing.T) {
 		},
 	}
 
-	msg := applyDevSwap("mongodb-headless", main, extras, false)
+	msg := applyDevSwap("mongodb-headless", main, extras, false, nil, nil)
 	if msg == "" {
 		t.Fatalf("expected dev-swap warning, got empty")
 	}
@@ -117,7 +117,7 @@ func TestApplyDevSwap_BitnamiRabbitSwapsToVanilla(t *testing.T) {
 	}
 	extras := map[string]compose.Service{}
 
-	msg := applyDevSwap("rabbitmq", main, extras, false)
+	msg := applyDevSwap("rabbitmq", main, extras, false, nil, nil)
 	if msg == "" {
 		t.Fatalf("expected dev-swap warning")
 	}
@@ -137,6 +137,69 @@ func TestApplyDevSwap_BitnamiRabbitSwapsToVanilla(t *testing.T) {
 	}
 }
 
+// TestApplyDevSwap_TranslatesSecretSourcedAuth covers the case
+// that bit us in mp-production: Bitnami's mongodb chart sources
+// MONGODB_ROOT_PASSWORD from a Secret via valueFrom.secretKeyRef,
+// so it lands in .env (env_file), NOT on the service's literal
+// Environment map. Without reading env_file, the dev-swap couldn't
+// find the password, didn't translate it, and mongo:7 errored:
+//
+//	missing 'MONGO_INITDB_ROOT_USERNAME' or 'MONGO_INITDB_ROOT_PASSWORD'
+//	both must be specified for a user to be created
+//
+// The fix is to read through both literal env AND env_file lines,
+// then re-emit the translated names back into env_file so mongo:7
+// picks them up at startup.
+func TestApplyDevSwap_TranslatesSecretSourcedAuth(t *testing.T) {
+	main := &compose.Service{
+		Image: "docker.io/bitnami/mongodb:7.0",
+		Environment: map[string]string{
+			// Cluster signal lives in literal env (set by Bitnami's
+			// pod template with a literal value, not a Secret ref).
+			"MONGODB_REPLICA_SET_MODE": "primary",
+		},
+		EnvFile: []string{".env"},
+	}
+	envFileLines := []string{
+		// Real-world shape: addEnvFileLine wraps in "..." quotes.
+		`MONGODB_ROOT_PASSWORD="x5sm/secret\"with-quote"`,
+	}
+	envFileSeen := map[string]bool{
+		"MONGODB_ROOT_PASSWORD": true,
+	}
+
+	msg := applyDevSwap("mongodb-headless", main, nil, false, &envFileLines, envFileSeen)
+	if msg == "" {
+		t.Fatalf("expected dev-swap warning even when password is in env_file")
+	}
+
+	// Default user "root" should be filled in (Bitnami's chart
+	// default) since password was set but no user.
+	if main.Environment["MONGO_INITDB_ROOT_USERNAME"] != "root" {
+		t.Errorf("MONGO_INITDB_ROOT_USERNAME = %q, want %q (chart default)", main.Environment["MONGO_INITDB_ROOT_USERNAME"], "root")
+	}
+	// Password must be picked up from env_file AND copied to literal
+	// Environment so the container actually receives it.
+	if got := main.Environment["MONGO_INITDB_ROOT_PASSWORD"]; got != `x5sm/secret"with-quote` {
+		t.Errorf("MONGO_INITDB_ROOT_PASSWORD = %q, want unescaped value with literal double-quote", got)
+	}
+	// The translated names should also land in env_file so the
+	// vanilla image picks them up via env_file even if literal env
+	// gets stripped or interpolated weirdly.
+	hasUser, hasPass := false, false
+	for _, line := range envFileLines {
+		if strings.HasPrefix(line, `MONGO_INITDB_ROOT_USERNAME=`) {
+			hasUser = true
+		}
+		if strings.HasPrefix(line, `MONGO_INITDB_ROOT_PASSWORD=`) {
+			hasPass = true
+		}
+	}
+	if !hasUser || !hasPass {
+		t.Errorf("translated names should be added to env_file; got user=%v pass=%v\n  full=%v", hasUser, hasPass, envFileLines)
+	}
+}
+
 // TestApplyDevSwap_PreserveImageOptOut verifies the localk.yaml
 // `preserve_image: true` knob actually keeps the chart image intact.
 // Required for users with custom plugin builds, TLS-enabled Bitnami
@@ -148,7 +211,7 @@ func TestApplyDevSwap_PreserveImageOptOut(t *testing.T) {
 			"MONGODB_REPLICA_SET_MODE": "primary",
 		},
 	}
-	msg := applyDevSwap("mongodb", main, nil, true)
+	msg := applyDevSwap("mongodb", main, nil, true, nil, nil)
 	if msg != "" {
 		t.Errorf("preserve_image=true should suppress dev-swap, got warning %q", msg)
 	}
@@ -169,7 +232,7 @@ func TestApplyDevSwap_SkipsNonClusteredBitnami(t *testing.T) {
 			// no REPLICA_SET_* / INITIAL_PRIMARY_HOST → not clustered
 		},
 	}
-	msg := applyDevSwap("mongo", main, nil, false)
+	msg := applyDevSwap("mongo", main, nil, false, nil, nil)
 	if msg != "" {
 		t.Errorf("non-clustered Bitnami image should NOT trigger swap, got %q", msg)
 	}
@@ -187,7 +250,7 @@ func TestApplyDevSwap_LeavesUnknownImages(t *testing.T) {
 			"DATABASE_URL": "postgres://...",
 		},
 	}
-	msg := applyDevSwap("app", main, nil, false)
+	msg := applyDevSwap("app", main, nil, false, nil, nil)
 	if msg != "" {
 		t.Errorf("non-chart image should be ignored, got swap warning %q", msg)
 	}

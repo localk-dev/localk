@@ -32,15 +32,76 @@ type devSwapRule struct {
 	// MatchImage returns true when the workload's image is one this
 	// rule knows how to swap.
 	matchImage func(image string) bool
-	// MatchEnv returns true when the env signals the cluster-mode
-	// setup that motivates the swap. A Bitnami image alone isn't
-	// enough — many users run Bitnami images as plain standalones.
-	matchEnv func(env map[string]string) bool
+	// MatchEnv returns true when env signals (from either the
+	// service's literal Environment OR the .env file we generated
+	// for secret-derived values) indicate the cluster-mode setup
+	// that motivates the swap. A Bitnami image alone isn't enough —
+	// many users run Bitnami images as plain standalones.
+	matchEnv func(lookup envLookup) bool
 	// DevImage is the vanilla replacement.
 	devImage string
-	// TransformService rewrites env / volumes / command on the
-	// workload's main service to match what the dev image expects.
-	transformService func(svc *compose.Service)
+	// TransformService rewrites the workload's main service to match
+	// what the dev image expects. The lookup gives access to env_file
+	// values so chart secrets can be re-emitted under the upstream
+	// image's env names.
+	transformService func(svc *compose.Service, lookup envLookup)
+}
+
+// envLookup unifies access to env values that may live on the
+// service's Environment map (literal values + downward-API
+// substitutions) or in the .env file (everything sourced from a
+// k8s Secret via valueFrom: secretKeyRef). Dev-swap rules read
+// through this so they don't miss values just because a Bitnami
+// chart sourced them from a Secret.
+type envLookup struct {
+	literal     map[string]string
+	envFileLines *[]string
+	envFileSeen  map[string]bool
+}
+
+// get returns the env value under name and whether it was found.
+// Searches the literal Environment first (it always wins because
+// downward-API substitutions override env_file in k8s too) and
+// falls back to .env entries for secret-derived values.
+func (l envLookup) get(name string) (string, bool) {
+	if v, ok := l.literal[name]; ok && v != "" {
+		return v, true
+	}
+	if l.envFileLines == nil {
+		return "", false
+	}
+	prefix := name + "="
+	for _, line := range *l.envFileLines {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		v := strings.TrimPrefix(line, prefix)
+		// addEnvFileLine wraps values in double quotes; unwrap.
+		if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+			v = v[1 : len(v)-1]
+		}
+		// Reverse the addEnvFileLine `\"` escaping so callers see
+		// the original value (matters for passwords containing ").
+		v = strings.ReplaceAll(v, `\"`, `"`)
+		return v, true
+	}
+	return "", false
+}
+
+// addToEnvFile re-emits a translated key/value into the .env file
+// so the swapped image picks it up via env_file. Existing entries
+// are left untouched (matches addEnvFileLine's first-write-wins
+// semantics).
+func (l envLookup) addToEnvFile(name, value string) {
+	if l.envFileLines == nil || value == "" {
+		return
+	}
+	if l.envFileSeen[name] {
+		return
+	}
+	l.envFileSeen[name] = true
+	escaped := strings.ReplaceAll(value, `"`, `\"`)
+	*l.envFileLines = append(*l.envFileLines, fmt.Sprintf(`%s="%s"`, name, escaped))
 }
 
 var devSwapRules = []devSwapRule{
@@ -49,13 +110,20 @@ var devSwapRules = []devSwapRule{
 		matchImage: func(img string) bool {
 			return imageMatches(img, "bitnami/mongodb", "bitnamilegacy/mongodb")
 		},
-		matchEnv: func(env map[string]string) bool {
+		matchEnv: func(l envLookup) bool {
 			// Replica-set mode signals are the canonical cluster
 			// bootstrap markers — they're set by the helm chart only
 			// when running as a StatefulSet replica set.
-			return env["MONGODB_REPLICA_SET_MODE"] != "" ||
-				env["MONGODB_REPLICA_SET_NAME"] != "" ||
-				env["MONGODB_INITIAL_PRIMARY_HOST"] != ""
+			for _, k := range []string{
+				"MONGODB_REPLICA_SET_MODE",
+				"MONGODB_REPLICA_SET_NAME",
+				"MONGODB_INITIAL_PRIMARY_HOST",
+			} {
+				if v, ok := l.get(k); ok && v != "" {
+					return true
+				}
+			}
+			return false
 		},
 		devImage:         "mongo:7",
 		transformService: standaloneMongo,
@@ -65,12 +133,17 @@ var devSwapRules = []devSwapRule{
 		matchImage: func(img string) bool {
 			return imageMatches(img, "bitnami/rabbitmq", "bitnamilegacy/rabbitmq")
 		},
-		matchEnv: func(env map[string]string) bool {
+		matchEnv: func(l envLookup) bool {
 			// USE_LONGNAME=true together with an `@` in NODE_NAME is
 			// the chart's clustering setup; USE_LONGNAME alone or a
 			// short node name would be a non-clustered config.
-			return env["RABBITMQ_USE_LONGNAME"] == "true" ||
-				strings.Contains(env["RABBITMQ_NODE_NAME"], "@")
+			if v, _ := l.get("RABBITMQ_USE_LONGNAME"); v == "true" {
+				return true
+			}
+			if v, _ := l.get("RABBITMQ_NODE_NAME"); strings.Contains(v, "@") {
+				return true
+			}
+			return false
 		},
 		devImage:         "rabbitmq:3-management",
 		transformService: standaloneRabbit,
@@ -86,25 +159,39 @@ var devSwapRules = []devSwapRule{
 // understand). main's depends_on entries pointing at those inits are
 // cleared so compose doesn't wait forever for services that no
 // longer exist.
-func applyDevSwap(svcName string, main *compose.Service, extras map[string]compose.Service, preserveImage bool) string {
+func applyDevSwap(
+	svcName string,
+	main *compose.Service,
+	extras map[string]compose.Service,
+	preserveImage bool,
+	envFileLines *[]string,
+	envFileSeen map[string]bool,
+) string {
 	if preserveImage {
 		return ""
 	}
-	envMap := main.Environment
-	if envMap == nil {
-		envMap = map[string]string{}
+	if main.Environment == nil {
+		main.Environment = map[string]string{}
+	}
+	if envFileSeen == nil {
+		envFileSeen = map[string]bool{}
+	}
+	lookup := envLookup{
+		literal:      main.Environment,
+		envFileLines: envFileLines,
+		envFileSeen:  envFileSeen,
 	}
 	for _, rule := range devSwapRules {
 		if !rule.matchImage(main.Image) {
 			continue
 		}
-		if !rule.matchEnv(envMap) {
+		if !rule.matchEnv(lookup) {
 			continue
 		}
 		original := main.Image
 		main.Image = rule.devImage
 		if rule.transformService != nil {
-			rule.transformService(main)
+			rule.transformService(main, lookup)
 		}
 		dropInitContainers(svcName, main, extras)
 		return fmt.Sprintf(
@@ -159,7 +246,11 @@ func imageMatches(image string, prefixes ...string) bool {
 //
 //   - Translates MONGODB_ROOT_USER/PASSWORD into the
 //     MONGO_INITDB_ROOT_USERNAME/PASSWORD names mongo:7's entrypoint
-//     reads on first boot.
+//     reads on first boot. Values that came from a Secret land in
+//     .env (env_file); the translated names are re-emitted there
+//     too so mongo:7 sees them via env_file. Mongo:7 requires both
+//     to be set together — if only the password is available the
+//     username defaults to "root" (Bitnami's chart default).
 //   - Drops every other MONGODB_*, MY_POD_*, K8S_*, BITNAMI_* env so
 //     the vanilla image sees only what it understands. (Mongo:7 just
 //     ignores unknown env, but a clean compose file is easier to
@@ -169,12 +260,22 @@ func imageMatches(image string, prefixes ...string) bool {
 //     use for). The PVC-backed datadir survives.
 //   - Clears command/entrypoint — the upstream image's defaults
 //     (`mongod --bind_ip_all`) are exactly what we want.
-func standaloneMongo(svc *compose.Service) {
-	if user := svc.Environment["MONGODB_ROOT_USER"]; user != "" {
-		svc.Environment["MONGO_INITDB_ROOT_USERNAME"] = user
+func standaloneMongo(svc *compose.Service, lookup envLookup) {
+	user, _ := lookup.get("MONGODB_ROOT_USER")
+	pass, hasPass := lookup.get("MONGODB_ROOT_PASSWORD")
+	// Bitnami defaults the root user to "root" when only the
+	// password is set; mongo:7 errors out if either is empty, so
+	// fill in the default to keep the connection-string contract.
+	if user == "" && hasPass {
+		user = "root"
 	}
-	if pass := svc.Environment["MONGODB_ROOT_PASSWORD"]; pass != "" {
+	if user != "" {
+		svc.Environment["MONGO_INITDB_ROOT_USERNAME"] = user
+		lookup.addToEnvFile("MONGO_INITDB_ROOT_USERNAME", user)
+	}
+	if pass != "" {
 		svc.Environment["MONGO_INITDB_ROOT_PASSWORD"] = pass
+		lookup.addToEnvFile("MONGO_INITDB_ROOT_PASSWORD", pass)
 	}
 	stripPrefixes(svc.Environment, "MONGODB_", "MY_POD_", "K8S_", "BITNAMI_")
 	// /bitnami is Bitnami's umbrella prefix for everything chart-
@@ -190,14 +291,20 @@ func standaloneMongo(svc *compose.Service) {
 // standaloneRabbit is the rabbitmq-3-management equivalent of
 // standaloneMongo. RABBITMQ_USERNAME/PASSWORD become
 // RABBITMQ_DEFAULT_USER/PASS (the names the upstream entrypoint
-// reads). Cluster/node-name env vars are dropped so the Erlang VM
-// uses its default short-name binding.
-func standaloneRabbit(svc *compose.Service) {
-	if user := svc.Environment["RABBITMQ_USERNAME"]; user != "" {
+// reads). Values sourced from a Secret arrive via env_file; we
+// re-emit the translated names there too. Cluster/node-name env
+// vars are dropped so the Erlang VM uses its default short-name
+// binding.
+func standaloneRabbit(svc *compose.Service, lookup envLookup) {
+	user, _ := lookup.get("RABBITMQ_USERNAME")
+	pass, _ := lookup.get("RABBITMQ_PASSWORD")
+	if user != "" {
 		svc.Environment["RABBITMQ_DEFAULT_USER"] = user
+		lookup.addToEnvFile("RABBITMQ_DEFAULT_USER", user)
 	}
-	if pass := svc.Environment["RABBITMQ_PASSWORD"]; pass != "" {
+	if pass != "" {
 		svc.Environment["RABBITMQ_DEFAULT_PASS"] = pass
+		lookup.addToEnvFile("RABBITMQ_DEFAULT_PASS", pass)
 	}
 	// Drop Bitnami-specific RABBITMQ_* env (everything except the
 	// DEFAULT_USER/PASS we just set). Also drop downward-API and
