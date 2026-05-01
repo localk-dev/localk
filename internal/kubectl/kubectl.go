@@ -117,6 +117,46 @@ func CurrentNamespace(r Runner) (string, error) {
 	return ns, nil
 }
 
+// ListContexts returns every kubeconfig context name. The TUI's
+// generate wizard uses this to let the user pick a cluster without
+// having to type the context name.
+func ListContexts(r Runner) ([]string, error) {
+	out, err := r.Run(context.Background(), "config", "view", "-o", "jsonpath={.contexts[*].name}")
+	if err != nil {
+		return nil, err
+	}
+	return splitNames(string(out)), nil
+}
+
+// ListNamespaces returns the namespaces visible in the given context
+// (or the active one when ctx is ""). The user may not have list-
+// namespaces RBAC in every cluster — surface the error rather than
+// returning a misleading empty list.
+func ListNamespaces(r Runner, kubeContext string) ([]string, error) {
+	args := []string{"get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"}
+	if kubeContext != "" {
+		args = append(args, "--context", kubeContext)
+	}
+	out, err := r.Run(context.Background(), args...)
+	if err != nil {
+		return nil, err
+	}
+	return splitNames(string(out)), nil
+}
+
+// splitNames parses a whitespace-separated jsonpath result into a
+// trimmed slice. Empty input yields an empty slice (not nil) so
+// callers can range over it without nil-checking.
+func splitNames(s string) []string {
+	out := []string{}
+	for _, name := range strings.Fields(strings.TrimSpace(s)) {
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // Fetch retrieves the resource kinds localk understands from a single
 // namespace, returning the raw YAML bytes (a single `kind: List` document).
 //

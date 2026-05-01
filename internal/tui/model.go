@@ -1,127 +1,72 @@
 // Package tui implements `localk tui` — an interactive Bubble Tea
-// dashboard that replaces the typed `localk disable foo bar` /
-// `localk dev foo --port 3000` workflows with arrow-key navigation
-// and single-keystroke toggles.
+// shell that exposes the localk command surface (generate, dashboard,
+// up, down) through a menu-driven UI. The TUI is the front door for
+// humans; the typed commands stay in place for scripting.
 //
-// Read/write is symmetrical with the typed commands: the TUI mutates
-// the same docker-compose.dev.yml and docker-compose.disable.yml
-// overlays, so a session can move freely between TUI and CLI.
+// Architecture: a top-level Model owns a `screen` enum and routes
+// Update/View to one of the sub-screens (menu, dashboard, generate
+// wizard, action runner). Each sub-screen is its own type with its
+// own Update/View methods; the top-level Model just dispatches.
 package tui
 
 import (
-	"github.com/charmbracelet/bubbles/textinput"
-
-	"github.com/localk-dev/localk/internal/compose"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
-// ServiceRow is one row in the dashboard list. It bundles everything
-// the renderer needs about a single service: the static facts from
-// the base compose file, the desired state from the overlays, and the
-// runtime state from `docker compose ps`.
-type ServiceRow struct {
-	Name     string
-	Image    string
-	Disabled bool   // sticky: in docker-compose.disable.yml
-	DevPort  int    // 0 if not in dev mode; non-zero = host port the proxy forwards to
-	Running  string // last-known state from `docker compose ps`: "running", "exited", "" (unknown)
-
-	// Pre-computed for sort stability and case-insensitive filter
-	// matching. Populated once at load.
-	lowerName string
-}
-
-// dirtyOp records a single pending change made via the TUI but not
-// yet persisted to the overlays. We collect these instead of mutating
-// the overlay files on every keystroke so `q` (quit) can offer to
-// discard, and `s` (save) is a single atomic operation per overlay.
-type dirtyOp struct {
-	kind    dirtyKind
-	service string
-	port    int // for devEnter
-}
-
-type dirtyKind int
+// screen is the top-level state machine: which sub-screen is
+// currently visible. Each value corresponds to one of the four
+// sub-models below.
+type screen int
 
 const (
-	disableToggleOn dirtyKind = iota
-	disableToggleOff
-	devEnter
-	devLeave
+	screenMenu screen = iota
+	screenDashboard
+	screenGenerate
+	screenAction
 )
 
-// mode is the simple state machine inside the TUI. Default is normal
-// list navigation; `/` enters filter, `e` enters port input, quitting
-// with unsaved changes enters confirm.
-type mode int
-
-const (
-	modeNormal mode = iota
-	modeFilter
-	modePortInput
-	modeConfirmQuit
-	modeHelp
-)
-
-// Model is the Bubble Tea model. Holds everything the Update/View
-// functions need.
+// Model is the Bubble Tea model passed to tea.NewProgram. Holds
+// shared state (terminal size, default out-dir) plus one instance of
+// each sub-screen's model. Sub-screens are constructed eagerly except
+// for the dashboard, which loads compose + overlay files and only
+// makes sense once the user navigates to it.
 type Model struct {
-	// Paths
-	outDir      string
-	composePath string
-	devPath     string
-	disablePath string
-
-	// Static state from the base compose file. Used for image display
-	// and as the source of truth for what services exist.
-	base *compose.File
-
-	// All rows in stable sort order (alphabetical by name). The
-	// filtered view derives from this plus the filter string.
-	rows []ServiceRow
-
-	// Visible rows after filtering, as indices into rows. Empty filter
-	// means visible == [0, 1, ..., len(rows)-1].
-	visible []int
-
-	// Cursor is an index into `visible` (NOT into rows directly), so
-	// the cursor stays anchored to whatever's currently shown.
-	cursor int
-
-	// Pending changes; flushed by `s`. Order matters because we
-	// replay them in sequence at save time, so a "disable then
-	// re-enable" within one session correctly cancels out.
-	pending []dirtyOp
-
-	// Live runtime state per service name. Updated by tickMsg.
-	runtime map[string]string // name -> "running" / "exited" / etc.
-
-	// Mode + UI state
-	mode      mode
-	filter    textinput.Model // filter text input (mode == modeFilter)
-	port      textinput.Model // port input (mode == modePortInput)
-	statusErr string          // last `docker compose ps` error, if any
-	flash     string          // one-shot footer message (e.g. conflict warnings)
-
-	// pendingDevService captures which service we're prompting for a
-	// port on (modePortInput). Cleared when the modal closes.
-	pendingDevService string
-
-	// Window dimensions, updated by tea.WindowSizeMsg.
+	screen        screen
 	width, height int
+	// outDir threads through to every sub-screen that needs to know
+	// where docker-compose.yml lives. Pre-filled from the --out-dir
+	// flag on `localk tui`.
+	outDir string
+
+	menu     menuModel
+	generate generateModel
+	action   actionModel
+	// dashboard is built lazily (on first entry to screenDashboard)
+	// so `localk tui` can show the menu even when no compose file
+	// exists yet — the missing-file error surfaces inline on the
+	// dashboard screen instead of refusing to launch the TUI.
+	dashboard *dashboardModel
+	// dashboardErr is the last error from newDashboardModel, surfaced
+	// inside screenDashboard when dashboard is nil. Cleared on
+	// successful (re-)load.
+	dashboardErr error
 }
 
-// dirty reports whether there are any pending unsaved changes.
-func (m *Model) dirty() bool { return len(m.pending) > 0 }
+// New constructs the top-level TUI model. Always succeeds — even when
+// no compose file exists at outDir. The dashboard's missing-file
+// error is deferred until the user actually picks Dashboard from the
+// menu.
+func New(outDir string) *Model {
+	return &Model{
+		screen:   screenMenu,
+		outDir:   outDir,
+		menu:     newMenuModel(),
+		generate: newGenerateModel(outDir),
+	}
+}
 
-// currentRow returns the row currently under the cursor, or nil if
-// the visible list is empty (which can happen when a filter matches
-// nothing).
-func (m *Model) currentRow() *ServiceRow {
-	if len(m.visible) == 0 {
-		return nil
-	}
-	if m.cursor < 0 || m.cursor >= len(m.visible) {
-		return nil
-	}
-	return &m.rows[m.visible[m.cursor]]
+func (m *Model) Init() tea.Cmd {
+	// The menu doesn't need an Init; sub-screens initialize on entry
+	// (e.g., the dashboard fires its first poll when loaded).
+	return nil
 }

@@ -143,10 +143,10 @@ func TestRestoreFromDev_RemovesPort(t *testing.T) {
 	}
 }
 
-// newTestModel produces a Model backed by real temp-dir files. Tests
+// newTestModel produces a dashboardModel backed by real temp-dir files. Tests
 // can mutate model state, call save(), and inspect the resulting
 // overlay files on disk.
-func newTestModel(t *testing.T) *Model {
+func newTestModel(t *testing.T) *dashboardModel {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(`
@@ -159,14 +159,14 @@ services:
 `), 0o644); err != nil {
 		t.Fatalf("write compose: %v", err)
 	}
-	m, err := New(dir)
+	m, err := newDashboardModel(dir)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	return m
 }
 
-func indexOf(m *Model, name string) int {
+func indexOf(m *dashboardModel, name string) int {
 	for i, r := range m.rows {
 		if r.Name == name {
 			return i

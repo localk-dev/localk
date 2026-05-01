@@ -14,7 +14,7 @@ import (
 // tick. Both run in parallel via tea.Batch — first poll fires
 // immediately so the user sees real status right away rather than
 // after pollInterval has elapsed.
-func (m *Model) Init() tea.Cmd {
+func (m *dashboardModel) Init() tea.Cmd {
 	return tea.Batch(
 		pollCmd(m.composePath, m.devPath, m.disablePath),
 		scheduleTick(),
@@ -22,7 +22,7 @@ func (m *Model) Init() tea.Cmd {
 }
 
 // Update is the main event-loop dispatcher.
-func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -66,13 +66,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // applyRuntimeToRows folds m.runtime into m.rows so View doesn't have
 // to do a map lookup per row. Cheap, called only when a new poll
 // arrives.
-func (m *Model) applyRuntimeToRows() {
+func (m *dashboardModel) applyRuntimeToRows() {
 	for i := range m.rows {
 		m.rows[i].Running = m.runtime[m.rows[i].Name]
 	}
 }
 
-func (m *Model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *dashboardModel) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Any keystroke clears a transient flash; otherwise warnings
 	// linger awkwardly between actions.
 	m.flash = ""
@@ -80,8 +80,8 @@ func (m *Model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q":
 		return m.attemptQuit()
-	case "ctrl+c":
-		return m.attemptQuit()
+	// ctrl+c is intercepted by the parent Model and turned into
+	// tea.Quit before it reaches us, so no case here.
 
 	case "up", "k":
 		if m.cursor > 0 {
@@ -123,7 +123,7 @@ func (m *Model) updateNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) updateFilterMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *dashboardModel) updateFilterMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.filter.Blur()
@@ -142,7 +142,7 @@ func (m *Model) updateFilterMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *Model) updatePortMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *dashboardModel) updatePortMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.cancelPortInput()
@@ -156,16 +156,22 @@ func (m *Model) updatePortMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *Model) updateConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *dashboardModel) updateConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y":
-		// Save then quit. m.save() returns a Cmd; we sequence quit
-		// after by using a small batch.
+		// Save, then signal the parent Model that we want to leave
+		// the dashboard and return to the menu. The parent reads
+		// requestExit in its Update wrapper.
 		m.mode = modeNormal
-		return m, tea.Sequence(m.save(), tea.Quit)
+		cmd := m.save()
+		m.requestExit = true
+		return m, cmd
 	case "n":
-		// Discard pending changes; quit immediately.
-		return m, tea.Quit
+		// Discard pending changes; request exit to menu.
+		m.pending = nil
+		m.mode = modeNormal
+		m.requestExit = true
+		return m, nil
 	case "esc":
 		m.mode = modeNormal
 		return m, nil
@@ -173,27 +179,31 @@ func (m *Model) updateConfirmMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) updateHelpMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *dashboardModel) updateHelpMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Any key dismisses help.
 	_ = msg
 	m.mode = modeNormal
 	return m, nil
 }
 
-// attemptQuit returns the right Cmd: tea.Quit when there's nothing
-// pending, or transitions to the confirm prompt when there are
-// unsaved changes.
-func (m *Model) attemptQuit() (tea.Model, tea.Cmd) {
+// attemptQuit handles the dashboard's `q` key. With unsaved changes
+// it transitions to the confirm prompt; otherwise it signals the
+// parent Model that the dashboard wants to leave (return to the
+// top-level menu). Full-quit (the program exits) is the parent's
+// job — triggered by ctrl+c, which the parent intercepts before
+// the message reaches us.
+func (m *dashboardModel) attemptQuit() (tea.Model, tea.Cmd) {
 	if m.dirty() {
 		m.mode = modeConfirmQuit
 		return m, nil
 	}
-	return m, tea.Quit
+	m.requestExit = true
+	return m, nil
 }
 
 // toggleDisable flips the disabled flag on the current row, with the
 // dev-mode conflict guard. Mirrors `localk disable`'s behavior.
-func (m *Model) toggleDisable() {
+func (m *dashboardModel) toggleDisable() {
 	row := m.currentRow()
 	if row == nil {
 		return
@@ -214,7 +224,7 @@ func (m *Model) toggleDisable() {
 // openPortInput moves into modePortInput for the current row. If the
 // row is already in dev mode the user should `r` to restore first;
 // re-entering dev would silently overwrite the existing port.
-func (m *Model) openPortInput() {
+func (m *dashboardModel) openPortInput() {
 	row := m.currentRow()
 	if row == nil {
 		return
@@ -233,14 +243,14 @@ func (m *Model) openPortInput() {
 	m.mode = modePortInput
 }
 
-func (m *Model) cancelPortInput() {
+func (m *dashboardModel) cancelPortInput() {
 	m.pendingDevService = ""
 	m.port.Blur()
 	m.port.SetValue("")
 	m.mode = modeNormal
 }
 
-func (m *Model) confirmPortInput() {
+func (m *dashboardModel) confirmPortInput() {
 	v := m.port.Value()
 	port, err := strconv.Atoi(v)
 	if err != nil || port <= 0 || port > 65535 {
@@ -261,7 +271,7 @@ func (m *Model) confirmPortInput() {
 	m.cancelPortInput()
 }
 
-func (m *Model) restoreFromDev() {
+func (m *dashboardModel) restoreFromDev() {
 	row := m.currentRow()
 	if row == nil {
 		return
@@ -278,7 +288,7 @@ func (m *Model) restoreFromDev() {
 // (tea.Cmd) that emits a saveResultMsg when done — but we keep it
 // synchronous for v1 since the writes are tiny YAML files. The
 // returned Cmd is nil-safe.
-func (m *Model) save() tea.Cmd {
+func (m *dashboardModel) save() tea.Cmd {
 	if !m.dirty() {
 		m.flash = "nothing to save"
 		return nil

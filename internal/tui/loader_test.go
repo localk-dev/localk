@@ -54,7 +54,7 @@ services:
 		t.Fatalf("write dev: %v", err)
 	}
 
-	m, err := New(dir)
+	m, err := newDashboardModel(dir)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -86,14 +86,14 @@ services:
 
 func TestNew_MissingCompose(t *testing.T) {
 	dir := t.TempDir()
-	_, err := New(dir)
+	_, err := newDashboardModel(dir)
 	if err == nil {
 		t.Fatal("expected error when compose file is missing")
 	}
 }
 
 func TestApplyFilter(t *testing.T) {
-	m := &Model{
+	m := &dashboardModel{
 		rows: []ServiceRow{
 			{Name: "api", lowerName: "api"},
 			{Name: "api-gateway", lowerName: "api-gateway"},
@@ -150,7 +150,7 @@ func TestParseDevForwardPort(t *testing.T) {
 	}
 }
 
-func findRow(m *Model, name string) *ServiceRow {
+func findRow(m *dashboardModel, name string) *ServiceRow {
 	for i := range m.rows {
 		if m.rows[i].Name == name {
 			return &m.rows[i]
@@ -159,7 +159,7 @@ func findRow(m *Model, name string) *ServiceRow {
 	return nil
 }
 
-func visibleNames(m *Model) []string {
+func visibleNames(m *dashboardModel) []string {
 	out := make([]string, 0, len(m.visible))
 	for _, idx := range m.visible {
 		out = append(out, m.rows[idx].Name)

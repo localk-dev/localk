@@ -164,3 +164,60 @@ func TestDefaultRunner_NoArgs(t *testing.T) {
 		t.Fatalf("expected ErrDisallowedVerb for empty args, got %v", err)
 	}
 }
+
+func TestListContexts(t *testing.T) {
+	r := &fakeRunner{output: []byte("prod-eu1 prod-us1 staging  dev-local\n")}
+	got, err := ListContexts(r)
+	if err != nil {
+		t.Fatalf("ListContexts: %v", err)
+	}
+	want := []string{"prod-eu1", "prod-us1", "staging", "dev-local"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	if len(r.got) != 1 || !reflect.DeepEqual(r.got[0], []string{"config", "view", "-o", "jsonpath={.contexts[*].name}"}) {
+		t.Errorf("unexpected args: %v", r.got)
+	}
+}
+
+func TestListContexts_Empty(t *testing.T) {
+	r := &fakeRunner{output: []byte("")}
+	got, err := ListContexts(r)
+	if err != nil {
+		t.Fatalf("ListContexts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty input should yield empty slice, got %v", got)
+	}
+	// And the slice itself should be non-nil so callers can range
+	// without nil-checking.
+	if got == nil {
+		t.Errorf("expected non-nil empty slice")
+	}
+}
+
+func TestListNamespaces(t *testing.T) {
+	r := &fakeRunner{output: []byte("default kube-system kube-public\n")}
+	got, err := ListNamespaces(r, "")
+	if err != nil {
+		t.Fatalf("ListNamespaces: %v", err)
+	}
+	want := []string{"default", "kube-system", "kube-public"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+	if len(r.got) != 1 || !reflect.DeepEqual(r.got[0], []string{"get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"}) {
+		t.Errorf("unexpected args (no context): %v", r.got)
+	}
+}
+
+func TestListNamespaces_WithContext(t *testing.T) {
+	r := &fakeRunner{output: []byte("default\n")}
+	if _, err := ListNamespaces(r, "prod-eu1"); err != nil {
+		t.Fatalf("ListNamespaces: %v", err)
+	}
+	want := []string{"get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}", "--context", "prod-eu1"}
+	if len(r.got) != 1 || !reflect.DeepEqual(r.got[0], want) {
+		t.Errorf("unexpected args: %v, want %v", r.got[0], want)
+	}
+}

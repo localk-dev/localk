@@ -21,11 +21,17 @@ const (
 	disableFilename = "docker-compose.disable.yml"
 )
 
-// New builds an initial Model by loading the base compose file and
-// both overlays from outDir. Returns an error only when the base
-// compose file is missing or unparseable — a missing overlay just
-// means "no services in dev / disabled mode," which is normal.
-func New(outDir string) (*Model, error) {
+// newDashboardModel builds an initial dashboardModel by loading the
+// base compose file and both overlays from outDir. Returns an error
+// only when the base compose file is missing or unparseable — a
+// missing overlay just means "no services in dev / disabled mode,"
+// which is normal.
+//
+// The top-level Model in model.go calls this lazily, when the user
+// chooses Dashboard from the menu. That way `localk tui` can show
+// the menu even before `localk generate` has produced a compose file
+// (the dashboard subscreen surfaces the missing-file error inline).
+func newDashboardModel(outDir string) (*dashboardModel, error) {
 	composePath := filepath.Join(outDir, composeFilename)
 	devPath := filepath.Join(outDir, devFilename)
 	disablePath := filepath.Join(outDir, disableFilename)
@@ -56,7 +62,7 @@ func New(outDir string) (*Model, error) {
 	portInput.CharLimit = 5
 	portInput.Width = 12
 
-	m := &Model{
+	m := &dashboardModel{
 		outDir:      outDir,
 		composePath: composePath,
 		devPath:     devPath,
@@ -131,7 +137,7 @@ func allIndices(n int) []int {
 // Empty filter → every row visible. Otherwise: case-insensitive
 // substring match on the service name. Cursor stays at the same row
 // when possible, otherwise clamps to a valid index.
-func (m *Model) applyFilter() {
+func (m *dashboardModel) applyFilter() {
 	q := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	if q == "" {
 		m.visible = allIndices(len(m.rows))

@@ -11,7 +11,7 @@ import (
 // header / divider / list / divider / footer. Modal modes (filter,
 // port input, confirm quit, help) overlay the footer area or the
 // middle of the screen.
-func (m *Model) View() string {
+func (m *dashboardModel) View() string {
 	var b strings.Builder
 
 	b.WriteString(m.renderHeader())
@@ -31,7 +31,7 @@ func (m *Model) View() string {
 	return b.String()
 }
 
-func (m *Model) renderHeader() string {
+func (m *dashboardModel) renderHeader() string {
 	dirty := ""
 	if m.dirty() {
 		dirty = " " + dirtyMarkerStyle.Render(fmt.Sprintf("[%d unsaved]", len(m.pending)))
@@ -45,13 +45,13 @@ func (m *Model) renderHeader() string {
 	return left + "  " + right
 }
 
-func (m *Model) renderTableHeader() string {
+func (m *dashboardModel) renderTableHeader() string {
 	return dividerStyle.Render(strings.Repeat("─", maxWidth(m.width, 80))) + "\n" +
 		fmt.Sprintf("  %-12s %-32s %s", subHeaderStyle.Render("STATUS"), subHeaderStyle.Render("SERVICE"), subHeaderStyle.Render("IMAGE")) + "\n" +
 		dividerStyle.Render(strings.Repeat("─", maxWidth(m.width, 80)))
 }
 
-func (m *Model) renderRows() string {
+func (m *dashboardModel) renderRows() string {
 	if len(m.visible) == 0 {
 		return "  " + subHeaderStyle.Render("(no services match filter)")
 	}
@@ -95,7 +95,7 @@ func renderStatus(row ServiceRow) string {
 	}
 }
 
-func (m *Model) renderFooter() string {
+func (m *dashboardModel) renderFooter() string {
 	switch m.mode {
 	case modeFilter:
 		return dividerStyle.Render(strings.Repeat("─", maxWidth(m.width, 80))) + "\n" +
@@ -126,7 +126,7 @@ func (m *Model) renderFooter() string {
 	return strings.Join(parts, "\n")
 }
 
-func (m *Model) renderHelp() string {
+func (m *dashboardModel) renderHelp() string {
 	body := strings.TrimSpace(`
 KEYS
 

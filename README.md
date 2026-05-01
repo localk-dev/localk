@@ -170,31 +170,51 @@ output and is meant to be a derived artifact.
 
 ## Interactive shell (`localk tui`)
 
-For configuring a 60-service stack, typing service names by hand gets old
-fast. `localk tui` opens an interactive Bubble Tea dashboard showing every
-service with its current state, navigable with arrow keys.
+`localk tui` is the front door for the whole tool: a menu-driven
+Bubble Tea UI that exposes generate, up, down, and the services
+dashboard without dropping back to the terminal. It launches even
+without a `docker-compose.yml` — useful for first-time bring-up.
 
 ```bash
 localk tui --out-dir ./build
 ```
 
 ```text
- localk — /work/build                                12 services
+ localk — ./build                                    4 action(s)
  ───────────────────────────────────────────────────────────────────
-   STATUS       SERVICE                  IMAGE
+ ▶ Generate    convert manifests → docker-compose.yml
+   Dashboard   manage services (dev mode, disable)
+   Up          start the stack (docker compose up -d)
+   Down        stop the stack (docker compose down)
  ───────────────────────────────────────────────────────────────────
+ ↑/↓ navigate  ·  enter select  ·  q quit
+```
+
+### Generate wizard
+
+A multi-step wizard for `localk generate`. Pick the source first:
+
+- **From local files** — type the path to your manifest directory.
+- **From kubectl cluster** — pick a context, then a namespace.
+
+End with the output directory (pre-filled with the current
+`--out-dir`) and a confirmation summary. Enter dispatches `localk
+generate` as a subprocess; you see its output in the terminal,
+then return to the menu when it finishes.
+
+### Dashboard
+
+Selecting **Dashboard** opens the v1 services view (the screen that
+used to be all of `localk tui`):
+
+```text
  ▶ ✓ up        api                      ghcr.io/example/api:1.0
    ✗ disabled  log-collector            example/log-collector:1.0
    ✓ enabled   notification-service     example/notifications:1.0
    → :3000     orders-service           example/orders:1.0
-   ⊙ stopped   reports-worker           example/reports:1.0
-   ✓ up        postgres                 postgres:16-alpine
-   ...
- ───────────────────────────────────────────────────────────────────
- ↑/↓ navigate · d disable · e dev · r restore · s save · / filter · ? help · q quit
 ```
 
-**Keys:**
+**Keys** (in the dashboard):
 - `↑`/`↓` (or `j`/`k`) — move cursor; `g`/`G` jump to top/bottom
 - `d` — toggle sticky disable on current service
 - `e` — enter dev mode (prompts for host port)
@@ -202,7 +222,8 @@ localk tui --out-dir ./build
 - `s` — save pending changes to overlays
 - `/` — filter by service name (substring match)
 - `?` — toggle help overlay
-- `q` (or `Ctrl-C`) — quit; warns about unsaved changes
+- `q` — return to menu (warns on unsaved changes)
+- `Ctrl-C` — quit the program
 
 **Status indicators:**
 - `✓ up` — enabled, container running (live from `docker compose ps`)
@@ -211,15 +232,18 @@ localk tui --out-dir ./build
 - `✗ disabled` — sticky-disabled in `docker-compose.disable.yml`
 - `→ :PORT` — in dev mode, proxy forwards to host PORT
 
-The TUI reads and writes the same `docker-compose.dev.yml` and
+The dashboard reads and writes the same `docker-compose.dev.yml` and
 `docker-compose.disable.yml` overlays as the typed `localk dev` and
 `localk disable` commands, so you can move between TUI and CLI freely.
-Pending changes are batched until you press `s` — `q` warns and offers to
-save before quitting.
+Pending changes are batched until you press `s`. Live status polling
+runs every 2 seconds in the background.
 
-Live status polling runs every 2 seconds in the background; if the docker
-daemon is offline or the stack isn't up yet, the TUI shows a one-line
-warning and keeps working in offline mode.
+### Up / Down
+
+Selecting **Up** or **Down** runs `docker compose up -d` /
+`docker compose down` against the current `--out-dir`, suspending the
+TUI so you see the compose output verbatim, then returns to a summary
+screen with `enter` / `esc` / `q` to go back to the menu.
 
 ## Working on one service (`localk dev`)
 
